@@ -126,6 +126,7 @@ def submit(request):
     instance = Instance.objects.get(instance_name=instance_name)
     db_name = request.POST.get('db_name')
     is_backup = True if request.POST.get('is_backup') == 'True' else False
+    backup_tables = ' '.join(request.POST.getlist('backup_tables'))
     notify_users = request.POST.getlist('notify_users')
     list_cc_addr = [email['email'] for email in Users.objects.filter(username__in=notify_users).values('email')]
 
@@ -177,6 +178,7 @@ def submit(request):
                 audit_auth_groups=Audit.settings(group_id, WorkflowDict.workflow_type['sqlreview']),
                 status=workflow_status,
                 is_backup=is_backup,
+                backup_tables = backup_tables,
                 instance=instance,
                 db_name=db_name,
                 is_manual=0,

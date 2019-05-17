@@ -174,6 +174,7 @@ class SqlWorkflow(models.Model):
     db_name = models.CharField('数据库', max_length=64)
     syntax_type = models.IntegerField('工单类型 0、未知，1、DDL，2、DML', choices=((0, '其他'), (1, 'DDL'), (2, 'DML')), default=0)
     is_backup = models.BooleanField('是否备份', choices=((False, '否'), (True, '是'),), default=True)
+    backup_tables = models.CharField('需备份表列表', default='', max_length=255)
     engineer = models.CharField('发起人', max_length=30)
     engineer_display = models.CharField('发起人中文名', max_length=50, default='')
     status = models.CharField(max_length=50, choices=SQL_WORKFLOW_CHOICES)
