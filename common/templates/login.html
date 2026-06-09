@@ -1,8 +1,8 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>SQL审核平台</title>
-    {% load staticfiles %}
+    <title>Login To Archery{{ custom_title_suffix }}</title>
+    {% load static %}
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <!-- 引入 Bootstrap -->
     <link href="{% static 'bootstrap/css/bootstrap.min.css' %}" rel="stylesheet">
@@ -13,28 +13,44 @@
          <script src="https://oss.maxcdn.com/libs/html5shiv/3.7.0/html5shiv.js"></script>
          <script src="https://oss.maxcdn.com/libs/respond.js/1.3.0/respond.min.js"></script>
       <![endif]-->
+    <link rel="shortcut icon" href="{% static 'img/favicon.ico' %}" />
 </head>
 <body style="background-color:#edeff1;">
 <div class="row lsb-login">
-    <div class="col-sm-4 mypanalbox">
+    <div class="col-sm-4 login-form-wrapper">
+        <h3 class="text-center">Login To Archery{{ custom_title_suffix }}</h3>
         <form class="login-form fade-in-effect" id="login" method="post" role="form">
             {% csrf_token %}
-            <div class="form-group is-focused">
-                <label class="control-label" for="inputUsername">Username</label>
-                <input class="form-control ng-valid ng-dirty ng-touched" id="inputUsername" name="username" type="text"
-                       required>
-            </div>
-            <div class="form-group is-focused">
-                <label class="control-label" for="inputPassword">Password</label>
-                <input class="form-control ng-valid ng-dirty ng-touched" id="inputPassword" name="password"
-                       type="password" required>
-            </div>
+            {% if dingding_enabled %}
+                <div class="form-group">
+                    <a class="btn btn-primary btn-block" role="button" href="/dingding/authenticate/">以钉钉登录</a>
+                </div>
+            {% elif oidc_enabled %}
+                <div class="form-group">
+                    <a class="btn btn-primary btn-block" role="button" href="/oidc/authenticate/">{{ oidc_btn_name }}</a>
+                </div>
+            {% elif cas_enabled %}
             <div class="form-group">
-                <button class="btn btn-primary btn-block" id="btnLogin" type="button"><i class="fa-lock"></i>登录</button>
+                <a class="btn btn-primary btn-block" role="button" href="/cas/authenticate/">CAS认证登录</a>
             </div>
-            <div class="form-group">
-                <a href="#" data-toggle="modal" data-target="#sign-up">注册用户</a>
-            </div>
+            {% endif %}
+            {% if dingding_enabled or oidc_enabled %}
+                <a data-toggle="collapse" href="#collapseExample" aria-expanded="false" aria-controls="collapseExample">
+                  显示传统登录
+                </a>
+                <div class="collapse" id="collapseExample">
+                  <div>
+                    {% include 'legacy_login_form.html' %}
+                  </div>
+                </div>
+            {% else %}
+                {% include 'legacy_login_form.html' %}
+            {% endif %}
+            {% if sign_up_enabled %}
+                <div class="form-group">
+                    <a href="#" data-toggle="modal" data-target="#sign-up">注册用户</a>
+                </div>
+            {% endif %}
         </form>
     </div>
 </div>
@@ -106,8 +122,8 @@
 </div>
 
 <!--底部部分 -->
-<div class="row clearfix user-bottom-div">
-    <p><strong>SQL审核平台</strong>&nbsp;(v1.6.3)</p>
+<div class="user-bottom-div">
+    <p><strong>&copy; Archery</strong>&nbsp;(v{{ archery_version }})</p>
 </div>
 <!-- jQuery (Bootstrap 的 JavaScript 插件需要引入 jQuery，务必先引入jquery js再引入bootstrap js) -->
 <script src="{% static 'jquery/jquery.min.js' %}"></script>
@@ -213,8 +229,13 @@
                 $('#btnLogin').prop('disabled', false);
             },
             success: function (data) {
-                if (data.status == 0) {
-                    $(location).attr('href', '/index/');
+                if (data.status === 0) {
+                    if (data.data) {
+                        document.cookie = "sessionid=" + data.data
+                        $(location).attr('href', '/login/2fa/');
+                    } else {
+                        $(location).attr('href', '/index/');
+                    }
                 } else {
                     $('#wrongpwd-modal-body').html(data.msg);
                     $('#wrongpwd-modal').modal({

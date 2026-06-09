@@ -1,0 +1,28 @@
+[tool.pytest.ini_options]
+python_files = "tests.py test_*.py *_tests.py"
+DJANGO_SETTINGS_MODULE = "archery.settings"
+
+[tool.coverage.run]
+source = [
+    "."
+]
+omit = [
+    # omit anything in a .local directory anywhere
+    "src*",
+    # omit everything in /usr
+    "downloads*",
+    # omit this single file
+    "sql/migrations/*",
+    "venv*"
+]
+
+[tool.coverage.report]
+omit = [
+    # omit anything in a .local directory anywhere
+    "src*",
+    # omit everything in /usr
+    "downloads*",
+    # omit this single file
+    "sql/migrations/*",
+    "venv*"
+]

@@ -1,0 +1,15 @@
+ARG PYTHON_BASE_IMAGE=library/python:3.11-bullseye
+FROM ${PYTHON_BASE_IMAGE}
+
+ENV SOAR_VERSION 0.11.0
+ENV TZ Asia/Shanghai
+
+ARG HTTPS_PROXY=""
+ARG HTTP_PROXY=""
+WORKDIR /opt
+
+COPY src/docker/setup.sh /opt/setup.sh
+RUN chmod +x /opt/setup.sh \
+    && /opt/setup.sh \
+    && rm -rf /opt/setup.sh
+

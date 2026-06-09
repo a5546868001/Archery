@@ -4,9 +4,11 @@
     <!-- 自定义操作按钮-->
     <div id="toolbar" class="btn-group">
         <a type="button" class="btn btn-default" href="/queryuserprivileges/">
+            <span class="glyphicon glyphicon-eye-open" aria-hidden="true"></span>
             <span aria-hidden="true"></span>权限管理</a>
         <button id="btn_add" type="button" class="btn btn-default"
                 data-toggle="modal" data-target="#apply">
+            <span class="glyphicon glyphicon-plus" aria-hidden="true"></span>
             <span aria-hidden="true"></span>权限申请
         </button>
     </div>
@@ -45,12 +47,9 @@
                                 title="请选择实例:"
                                 data-live-search="true" required>
                             // TODO 使用models中的choices 渲染
-                            <optgroup id="optgroup-mysql" label="MySQL"></optgroup>
-                            <optgroup id="optgroup-mssql" label="MsSQL"></optgroup>
-                            <optgroup id="optgroup-redis" label="Redis"></optgroup>
-                            <optgroup id="optgroup-pgsql" label="PgSQL"></optgroup>
-                            <optgroup id="optgroup-oracle" label="Oracle"></optgroup>
-
+                            {% for name, engine in engines.items %}
+                                <optgroup id="optgroup-{{ name }}" label="{{ engine.name }}"></optgroup>
+                            {%  endfor %}
                         </select>
                     </div>
                     <div class="form-group">
@@ -90,13 +89,14 @@
                         </select>
                     </div>
                     <div class="form-group">
-                        <select id="limit_num" name="limit_num"
-                                title="请选择查询限制行数:"
-                                class="form-control selectpicker show-tick bs-select-hidden ">
+                        <input id="limit_num" list="limits" type="number"
+                               class="form-control "
+                               placeholder="请选择查询限制行数:">
+                        <datalist id="limits">
                             <option value=100>100</option>
                             <option value=500>500</option>
                             <option value=1000>1000</option>
-                        </select>
+                        </datalist>
                     </div>
                     <!--审批流程-->
                     <div id="div-workflow_auditors" class="form-group" style="display: none">
@@ -151,28 +151,16 @@
                 },
                 success: function (data) {
                     if (data.status === 0) {
-                        var result = data['data'];
-                        $("#optgroup-mysql").empty();
-                        $("#optgroup-mssql").empty();
-                        $("#optgroup-redis").empty();
-                        $("#optgroup-pgsql").empty();
-                        $("#optgroup-oracle").empty();
-                        for (var i = 0; i < result.length; i++) {
-                            var instance = "<option value=\"" + result[i]['instance_name'] + "\">" + result[i]['instance_name'] + "</option>";
-                            if (result[i]['db_type'] === 'mysql') {
-                                $("#optgroup-mysql").append(instance);
-                            } else if (result[i]['db_type'] === 'mssql') {
-                                $("#optgroup-mssql").append(instance);
-                            } else if (result[i]['db_type'] === 'redis') {
-                                $("#optgroup-redis").append(instance);
-                            } else if (result[i]['db_type'] === 'pgsql') {
-                                $("#optgroup-pgsql").append(instance);
-                            } else if (result[i]['db_type'] === 'oracle') {
-                                $("#optgroup-oracle").append(instance);
+                        $("optgroup[id^='optgroup']").empty();
+                        let result = data['data']
+                        const supportDb = [ {% for name in engines.keys %}"{{ name }}", {% endfor %}]
+                        for (let i of result) {
+                            let instance = "<option value=\"" + i.instance_name + "\" instance-id=" + i.id + ">" + i.instance_name + "</option>";
+                            if (supportDb.indexOf(i.db_type) !== -1) {
+                                $("#optgroup-" + i.db_type).append(instance);
                             }
                         }
-                        $('#instance_name').selectpicker('render');
-                        $('#instance_name').selectpicker('refresh');
+                        $('#instance_name').selectpicker('render').selectpicker('refresh');
                     } else {
                         alert(data.msg);
                     }
@@ -237,7 +225,7 @@
                 sortOrder: "asc",                   //排序方式
                 sidePagination: "server",           //分页方式：client客户端分页，server服务端分页（*）
                 pageNumber: 1,                      //初始化加载第一页，默认第一页,并记录
-                pageSize: 14,                     //每页的记录行数（*）
+                pageSize: 20,                     //每页的记录行数（*）
                 pageList: [20, 30, 50, 100],       //可供选择的每页的行数（*）
                 search: true,                      //是否显示表格搜索
                 strictSearch: false,                //是否全匹配搜索
@@ -318,7 +306,7 @@
                     title: '权限级别',
                     field: 'priv_type',
                     formatter: function (value, row, index) {
-                        if (value === 1) {
+                        if (String(value) === '1') {
                             return 'DATABASE';
                         } else {
                             return 'TABLE';
@@ -354,9 +342,7 @@
                 }],
                 onLoadSuccess: function () {
                 },
-                onLoadError: function () {
-                    alert("数据加载失败！请检查接口返回信息和错误日志！");
-                },
+                onLoadError: onLoadErrorCallback,
                 onSearch: function (e) {
                     //传搜索参数给服务器
                     queryParams(e)
@@ -372,7 +358,7 @@
         //实例变更获取数据库列表/权限类型
         $("#instance_name").change(function () {
             $.ajax({
-                type: "post",
+                type: "get",
                 url: "/instance/instance_resource/",
                 dataType: "json",
                 data: {
@@ -421,7 +407,7 @@
         //数据库变更获取表名称
         $("#db_name").change(function () {
             $.ajax({
-                type: "post",
+                type: "get",
                 url: "/instance/instance_resource/",
                 dataType: "json",
                 data: {
@@ -609,7 +595,7 @@
                         sortOrder: "asc",                   //排序方式
                         sidePagination: "client",           //分页方式：client客户端分页，server服务端分页（*）
                         pageNumber: 1,                      //初始化加载第一页，默认第一页,并记录
-                        pageSize: 14,                     //每页的记录行数（*）
+                        pageSize: 20,                     //每页的记录行数（*）
                         pageList: [20, 30, 50, 100],       //可供选择的每页的行数（*）
                         search: false,                      //是否显示表格搜索
                         strictSearch: false,                //是否全匹配搜索
@@ -638,9 +624,7 @@
                         }],
                         onLoadSuccess: function () {
                         },
-                        onLoadError: function () {
-                            alert("数据加载失败！请检查接口返回信息和错误日志！");
-                        }
+                        onLoadError: onLoadErrorCallback,
                     });
                 },
                 error: function (XMLHttpRequest, textStatus, errorThrown) {

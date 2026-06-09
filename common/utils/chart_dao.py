@@ -1,29 +1,26 @@
 # -*- coding: UTF-8 -*-
 
-import MySQLdb
-from datetime import datetime, timedelta
+from datetime import timedelta
 from django.db import connection
 
 
 class ChartDao(object):
-    # 直接在archery数据库查询数据，用于报表
-    def __query(self, sql):
+    # 直接在Archery数据库查询数据，用于报表
+    @staticmethod
+    def __query(sql):
         cursor = connection.cursor()
-        effect_row = cursor.execute(sql)
+        cursor.execute(sql)
         rows = cursor.fetchall()
         fields = cursor.description
         column_list = []
         if fields:
             for i in fields:
                 column_list.append(i[0])
-        result = {}
-        result['column_list'] = column_list
-        result['rows'] = rows
-        result['effect_row'] = effect_row
-        return result
+        return {"column_list": column_list, "rows": rows}
 
     # 获取连续时间
-    def get_date_list(self, begin_date, end_date):
+    @staticmethod
+    def get_date_list(begin_date, end_date):
         dates = []
         this_day = begin_date
         while this_day <= end_date:
@@ -32,103 +29,223 @@ class ChartDao(object):
         return dates
 
     # 语法类型
-    def syntax_type(self):
-        sql = '''
+    def syntax_type(self, start_date, end_date):
+        sql = """
         select
           case when syntax_type = 1
             then 'DDL'
           when syntax_type = 2
             then 'DML'
+          else '其他'
           end as syntax_type,
           count(*)
-        from sql_workflow
-        group by syntax_type;'''
+        from sql_workflow 
+        where create_time >= '{}' and create_time <= '{}'
+        group by syntax_type;""".format(start_date, end_date)
         return self.__query(sql)
 
     # 工单数量统计
-    def workflow_by_date(self, cycle):
-        sql = '''
+    def workflow_by_date(self, start_date, end_date):
+        sql = """
         select
           date_format(create_time, '%Y-%m-%d'),
           count(*)
         from sql_workflow
-        where create_time >= date_add(now(), interval -{} day)
+        where create_time >= '{}' and create_time <= '{}'
         group by date_format(create_time, '%Y-%m-%d')
-        order by 1 asc;'''.format(cycle)
+        order by 1 asc;""".format(start_date, end_date)
         return self.__query(sql)
 
     # 工单按组统计
-    def workflow_by_group(self, cycle):
-        sql = '''
+    def workflow_by_group(self, start_date, end_date):
+        sql = """
         select
           group_name,
           count(*)
         from sql_workflow
-        where create_time >= date_add(now(), interval -{} day )
+        where create_time >= '{}' and create_time <= '{}'
         group by group_id
-        order by count(*) desc;'''.format(cycle)
+        order by count(*) desc;""".format(start_date, end_date)
         return self.__query(sql)
 
-    def workflow_by_user(self, cycle):
+    def workflow_by_user(self, start_date, end_date):
         """工单按人统计"""
         # TODO select 的对象应该为engineer ID, 查询时应作联合查询查出用户中文名
-        sql = '''
+        sql = """
         select
           engineer_display,
           count(*)
         from sql_workflow
-        where create_time >= date_add(now(), interval -{} day)
+        where create_time >= '{}' and create_time <= '{}'
         group by engineer_display
-        order by count(*) desc;'''.format(cycle)
+        order by count(*) desc;""".format(start_date, end_date)
         return self.__query(sql)
 
-
     # SQL查询统计(每日检索行数)
-    def querylog_effect_row_by_date(self, cycle):
-        sql = '''
+    def querylog_effect_row_by_date(self, start_date, end_date):
+        sql = """
         select
           date_format(create_time, '%Y-%m-%d'),
           sum(effect_row)
         from query_log
-        where create_time >= date_add(now(), interval -{} day )
+        where create_time >= '{}' and create_time <= '{}'
         group by date_format(create_time, '%Y-%m-%d')
-        order by sum(effect_row) desc;'''.format(cycle)
+        order by sum(effect_row) desc;""".format(start_date, end_date)
         return self.__query(sql)
 
     # SQL查询统计(每日检索次数)
-    def querylog_count_by_date(self, cycle):
-        sql = '''
+    def querylog_count_by_date(self, start_date, end_date):
+        sql = """
         select
           date_format(create_time, '%Y-%m-%d'),
           count(*)
         from query_log
-        where create_time >= date_add(now(), interval -{} day )
+        where create_time >= '{}' and create_time <= '{}'
         group by date_format(create_time, '%Y-%m-%d')
-        order by count(*) desc;'''.format(cycle)
+        order by count(*) desc;""".format(start_date, end_date)
         return self.__query(sql)
 
     # SQL查询统计(用户检索行数)
-    def querylog_effect_row_by_user(self, cycle):
-        sql = '''
+    def querylog_effect_row_by_user(self, start_date, end_date):
+        sql = """
         select 
           user_display,
           sum(effect_row)
         from query_log
-        where create_time >= date_add(now(), interval -{} day)
+        where create_time >= '{}' and create_time <= '{}'
         group by user_display
         order by sum(effect_row) desc
-        limit 10;'''.format(cycle)
+        limit 20;""".format(start_date, end_date)
         return self.__query(sql)
 
     # SQL查询统计(DB检索行数)
-    def querylog_effect_row_by_db(self, cycle):
-        sql = '''
+    def querylog_effect_row_by_db(self, start_date, end_date):
+        sql = """
        select
           db_name,
           sum(effect_row)
         from query_log
-        where create_time >= date_add(now(), interval -{} day)
+        where create_time >= '{}' and create_time <= '{}'
         group by db_name
         order by sum(effect_row) desc
-        limit 10;'''.format(cycle)
+        limit 20;""".format(start_date, end_date)
+        return self.__query(sql)
+
+    # 慢日志历史趋势图(按次数)
+    def slow_query_review_history_by_cnt(self, checksum):
+        sql = f"""select sum(ts_cnt),date(date_add(ts_min, interval 8 HOUR))
+from mysql_slow_query_review_history
+where checksum = '{checksum}'
+group by date(date_add(ts_min, interval 8 HOUR));"""
+        return self.__query(sql)
+
+    # 慢日志历史趋势图(按时长)
+    def slow_query_review_history_by_pct_95_time(self, checksum):
+        sql = f"""select truncate(MAX(Query_time_pct_95),6),date(date_add(ts_min, interval 8 HOUR))
+from mysql_slow_query_review_history
+where checksum = '{checksum}'
+group by date(date_add(ts_min, interval 8 HOUR));"""
+        return self.__query(sql)
+
+    # Redis慢日志历史趋势图(按次数)
+    def redis_slow_query_review_history_by_cnt(self, checksum, hostnames):
+        hostname_list = "','".join(hostnames)
+        sql = f"""select sum(cnt),date(ts_min)
+from redis_slow_query_review_history
+where checksum = '{checksum}'
+and hostname in ('{hostname_list}')
+group by date(ts_min);"""
+        return self.__query(sql)
+
+    # Redis慢日志历史趋势图(按时长)
+    def redis_slow_query_review_history_by_pct_95_time(self, checksum, hostnames):
+        hostname_list = "','".join(hostnames)
+        sql = f"""select truncate(MAX(duration_pct_95),6),date(ts_min)
+from redis_slow_query_review_history
+where checksum = '{checksum}'
+and hostname in ('{hostname_list}')
+group by date(ts_min);"""
+        return self.__query(sql)
+
+    # 慢日志db/user维度统计
+    def slow_query_count_by_db_by_user(self):
+        sql = """
+        select
+            concat(db_max,' user: ' ,user_max),
+            sum(ts_cnt) 
+        from mysql_slow_query_review_history 
+        where ts_min >= date_sub(now(),INTERVAL 24 hour)
+        and db_max is not null
+        group by db_max,user_max order by sum(ts_cnt) desc limit 50;
+        """
+        return self.__query(sql)
+
+    # 慢日志db维度统计
+    def slow_query_count_by_db(self):
+        sql = """
+        select
+            db_max,
+            sum(ts_cnt) 
+        from mysql_slow_query_review_history 
+        where ts_min >= date_sub(now(),INTERVAL 24 hour)
+        and db_max is not null
+        group by db_max order by sum(ts_cnt) desc limit 50;
+        """
+        return self.__query(sql)
+
+    # 数据库实例类型统计
+    def instance_count_by_type(self):
+        sql = """
+        select db_type,count(1) as cn 
+        from sql_instance 
+        group by db_type 
+        order by 2 desc;"""
+        return self.__query(sql)
+
+    def query_sql_prod_bill(self, start_date, end_date):
+        sql = """
+            SELECT
+                CASE
+                        a.STATUS 
+                        WHEN 'workflow_finish' THEN
+                        '已正常结束' 
+                        WHEN 'workflow_autoreviewwrong' THEN
+                        '自动审核不通过' 
+                        WHEN 'workflow_abort' THEN
+                        '人工终止流程' 
+                        WHEN 'workflow_exception' THEN
+                        '执行有异常' 
+                        WHEN 'workflow_review_pass' THEN
+                        '审核通过' 
+                        WHEN 'workflow_queuing' THEN
+                        '排队中' 
+                        WHEN 'workflow_executing' THEN
+                        '确认中' 
+                        WHEN 'workflow_manreviewing' THEN
+                        '等待审核人审核' ELSE '未知状态' 
+                    END AS status_desc,
+                    COUNT( 1 ) AS count 
+                FROM sql_workflow a
+                    INNER JOIN sql_instance b ON ( a.instance_id = b.id ) 
+                WHERE a.create_time >= '{}' and a.create_time <= '{}'
+                GROUP BY a.STATUS
+                ORDER BY 1;
+          """.format(start_date, end_date)
+        return self.__query(sql)
+
+    def query_instance_env_info(self):
+        sql = """
+             SELECT
+            db_type,
+            type,
+            COUNT(1) AS cn
+        FROM
+            sql_instance
+        GROUP BY
+            db_type,
+            type
+        ORDER BY
+            1,
+            2;
+        """
         return self.__query(sql)

@@ -1,13 +1,14 @@
 # -*- coding: UTF-8 -*-
-""" 
-@author: hhyo 
-@license: Apache Licence 
-@file: timer.py 
+"""
+@author: hhyo
+@license: Apache Licence
+@file: timer.py
 @time: 2019/05/15
 """
+
 import datetime
 
-__author__ = 'hhyo'
+__author__ = "hhyo"
 
 
 class FuncTimer(object):
