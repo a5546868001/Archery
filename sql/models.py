@@ -144,6 +144,7 @@ DB_TYPE_CHOICES = (
     ("mssql", "MsSQL"),
     ("redis", "Redis"),
     ("pgsql", "PgSQL"),
+    ("gaussdb", "GaussDB"),
     ("oracle", "Oracle"),
     ("mongo", "Mongo"),
     ("phoenix", "Phoenix"),
@@ -314,6 +315,11 @@ class WorkflowAuditMixin:
             )
         except WorkflowAudit.DoesNotExist:
             return None
+
+    @property
+    def audit_id(self) -> Optional[int]:
+        audit = self.get_audit()
+        return audit.audit_id if audit else None
 
 
 class SqlWorkflow(models.Model, WorkflowAuditMixin):

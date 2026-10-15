@@ -214,6 +214,13 @@ class InstanceDetailSerializer(serializers.ModelSerializer):
         }
 
 
+class PublicInstanceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Instance
+        fields = ["id", "instance_name", "db_type", "type"]
+        read_only_fields = fields
+
+
 class TunnelSerializer(serializers.ModelSerializer):
     class Meta:
         model = Tunnel
@@ -264,7 +271,8 @@ class ArchiveConfigSerializer(serializers.ModelSerializer):
 class InstanceResourceSerializer(serializers.Serializer):
     instance_id = serializers.IntegerField(label="实例id")
     resource_type = serializers.ChoiceField(
-        choices=["database", "schema", "table", "column"], label="资源类型"
+        choices=["database", "schema", "table", "column", "server_info"],
+        label="资源类型",
     )
     db_name = serializers.CharField(required=False, label="数据库名")
     schema_name = serializers.CharField(required=False, label="schema名")
@@ -318,6 +326,79 @@ class TableInstanceLookupResponseSerializer(serializers.Serializer):
     count = serializers.IntegerField()
     data = TableInstanceSerializer(many=True)
     summary = LocatorExecutionSummarySerializer(required=False, allow_null=True)
+
+
+class SqlQueryInstancesQuerySerializer(serializers.Serializer):
+    type = serializers.CharField(required=False, allow_blank=True)
+    db_type = serializers.ListField(
+        child=serializers.CharField(), required=False, allow_empty=True
+    )
+    tag_codes = serializers.ListField(
+        child=serializers.CharField(), required=False, allow_empty=True
+    )
+
+
+class SqlQueryResourceQuerySerializer(serializers.Serializer):
+    instance_id = serializers.IntegerField(required=False)
+    instance_name = serializers.CharField(required=False, allow_blank=True)
+    resource_type = serializers.ChoiceField(
+        choices=["database", "schema", "table", "column", "server_info"]
+    )
+    db_name = serializers.CharField(required=False, allow_blank=True)
+    schema_name = serializers.CharField(required=False, allow_blank=True)
+    tb_name = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        if not attrs.get("instance_id") and not attrs.get("instance_name"):
+            raise serializers.ValidationError(
+                "instance_id 或 instance_name 必须提供一个"
+            )
+        resource_type = attrs.get("resource_type")
+        if resource_type in ("table", "schema") and not attrs.get("db_name"):
+            raise serializers.ValidationError("db_name 不能为空")
+        if resource_type == "column" and (
+            not attrs.get("db_name") or not attrs.get("tb_name")
+        ):
+            raise serializers.ValidationError("column 查询需提供 db_name 和 tb_name")
+        return attrs
+
+
+class SqlQueryDescribeTableSerializer(serializers.Serializer):
+    instance_name = serializers.CharField()
+    db_name = serializers.CharField()
+    tb_name = serializers.CharField()
+    schema_name = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class SqlQueryExecuteSerializer(serializers.Serializer):
+    instance_name = serializers.CharField()
+    db_name = serializers.CharField()
+    schema_name = serializers.CharField(required=False, allow_blank=True)
+    tb_name = serializers.CharField(required=False, allow_blank=True)
+    sql_content = serializers.CharField()
+    limit_num = serializers.IntegerField(min_value=0, required=False, default=0)
+
+
+class SqlQueryLogsQuerySerializer(serializers.Serializer):
+    limit = serializers.IntegerField(required=False, default=0, min_value=0)
+    offset = serializers.IntegerField(required=False, default=0, min_value=0)
+    search = serializers.CharField(required=False, allow_blank=True, default="")
+    star = serializers.CharField(required=False, allow_blank=True, default="")
+    query_log_id = serializers.IntegerField(required=False)
+    start_date = serializers.CharField(required=False, allow_blank=True, default="")
+    end_date = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate_star(self, value):
+        return str(value).lower() == "true"
+
+
+class SqlQueryFavoriteSerializer(serializers.Serializer):
+    query_log_id = serializers.IntegerField(min_value=1)
+    star = serializers.CharField()
+    alias = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate_star(self, value):
+        return str(value).lower() == "true"
 
 
 class ExecuteCheckSerializer(serializers.Serializer):
@@ -388,6 +469,46 @@ class WorkflowSerializer(serializers.ModelSerializer):
         }
 
 
+class SqlWorkflowDetailSerializer(serializers.ModelSerializer):
+    audit_id = serializers.IntegerField(read_only=True, allow_null=True)
+    workflow_id = serializers.IntegerField(source="id", read_only=True)
+    instance_name = serializers.CharField(
+        source="instance.instance_name", read_only=True
+    )
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+
+    class Meta:
+        model = SqlWorkflow
+        fields = [
+            "audit_id",
+            "workflow_id",
+            "id",
+            "workflow_name",
+            "demand_url",
+            "group_id",
+            "group_name",
+            "instance",
+            "instance_name",
+            "db_name",
+            "syntax_type",
+            "is_backup",
+            "engineer",
+            "engineer_display",
+            "status",
+            "status_display",
+            "audit_auth_groups",
+            "run_date_start",
+            "run_date_end",
+            "create_time",
+            "finish_time",
+            "is_manual",
+            "is_offline_export",
+            "export_format",
+            "file_name",
+        ]
+        read_only_fields = fields
+
+
 class WorkflowContentSerializer(serializers.ModelSerializer):
     workflow = WorkflowSerializer()
 
@@ -430,8 +551,11 @@ class WorkflowContentSerializer(serializers.ModelSerializer):
                 check_result = check_engine.execute_check(
                     db_name=workflow_data["db_name"], sql=sql_content
                 )
-        except Exception as e:
-            raise serializers.ValidationError({"errors": str(e)})
+        except Exception:
+            logger.exception("提交工单检测失败")
+            raise serializers.ValidationError(
+                {"errors": "提交工单检测失败，请联系管理员"}
+            )
 
         # 未开启备份选项，并且engine支持备份，强制设置备份
         is_backup = (
@@ -465,9 +589,9 @@ class WorkflowContentSerializer(serializers.ModelSerializer):
                 # 自动创建工作流
                 auditor = get_auditor(workflow=workflow)
                 auditor.create_audit()
-        except Exception as e:
+        except Exception:
             logger.error(f"提交工单报错，错误信息：{traceback.format_exc()}")
-            raise serializers.ValidationError({"errors": str(e)})
+            raise serializers.ValidationError({"errors": "提交工单失败，请联系管理员"})
         # 有时候提交后自动审批通过, 在这里改写一下 workflow 状态
         if auditor.audit.current_status == WorkflowStatus.REJECTED:
             auditor.workflow.status = "workflow_autoreviewwrong"
@@ -575,6 +699,40 @@ class WorkflowLogListSerializer(serializers.ModelSerializer):
         ]
 
 
+class WorkflowStatusResponseSerializer(serializers.Serializer):
+    status = serializers.CharField()
+    msg = serializers.CharField(allow_blank=True)
+    data = serializers.JSONField()
+
+
+class WorkflowActionResultDataSerializer(serializers.Serializer):
+    audit_id = serializers.IntegerField(allow_null=True)
+    workflow_id = serializers.IntegerField()
+    redirect_url = serializers.CharField()
+
+
+class WorkflowActionResultSerializer(serializers.Serializer):
+    status = serializers.IntegerField()
+    msg = serializers.CharField()
+    data = WorkflowActionResultDataSerializer()
+
+
+class WorkflowContentResponseSerializer(serializers.Serializer):
+    rows = serializers.ListField(child=serializers.DictField())
+
+
+class WorkflowLogRowResponseSerializer(serializers.Serializer):
+    operation_type_desc = serializers.CharField()
+    operation_info = serializers.CharField()
+    operator_display = serializers.CharField()
+    operation_time = serializers.DateTimeField()
+
+
+class WorkflowLogListResponseSerializer(serializers.Serializer):
+    total = serializers.IntegerField()
+    rows = WorkflowLogRowResponseSerializer(many=True)
+
+
 class ExecuteWorkflowSerializer(serializers.Serializer):
     engineer = serializers.CharField(required=False, label="操作用户")
     workflow_id = serializers.IntegerField(label="工单id")
@@ -615,3 +773,49 @@ class ExecuteWorkflowSerializer(serializers.Serializer):
             raise serializers.ValidationError({"errors": "不存在该工单"})
 
         return attrs
+
+
+class WorkflowListRequestSerializer(serializers.Serializer):
+    syntax_type = serializers.ListField(
+        child=serializers.IntegerField(), required=False
+    )
+    navStatus = serializers.CharField(required=False, allow_blank=True)
+    instance_id = serializers.IntegerField(required=False, allow_null=True)
+    group_id = serializers.IntegerField(required=False, allow_null=True)
+    start_date = serializers.DateField(required=False)
+    end_date = serializers.DateField(required=False)
+    limit = serializers.IntegerField(required=False, min_value=0)
+    offset = serializers.IntegerField(required=False, min_value=0)
+    search = serializers.CharField(required=False, allow_blank=True)
+
+
+class WorkflowRemarkSerializer(serializers.Serializer):
+    audit_remark = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class WorkflowTerminationSerializer(serializers.Serializer):
+    cancel_remark = serializers.CharField(allow_blank=False, trim_whitespace=True)
+
+
+class WorkflowRejectionSerializer(serializers.Serializer):
+    reject_remark = serializers.CharField(allow_blank=False, trim_whitespace=True)
+
+
+class WorkflowExecutionSerializer(serializers.Serializer):
+    mode = serializers.ChoiceField(choices=["auto", "manual"])
+
+
+class WorkflowScheduleSerializer(serializers.Serializer):
+    run_date = serializers.DateTimeField(input_formats=["%Y-%m-%d %H:%M"])
+
+
+class WorkflowExecutionWindowSerializer(serializers.Serializer):
+    run_date_start = serializers.DateTimeField(required=False, allow_null=True)
+    run_date_end = serializers.DateTimeField(required=False, allow_null=True)
+
+
+class WorkflowOscSerializer(serializers.Serializer):
+    sqlsha1 = serializers.CharField(allow_blank=False)
+    command = serializers.ChoiceField(
+        choices=["get", "kill", "pause", "resume"], allow_blank=False
+    )

@@ -58,6 +58,7 @@ class TestView(TransactionTestCase):
         self.res_group = ResourceGroup.objects.create(
             group_id=1, group_name="group_name"
         )
+        self.audit_group = Group.objects.create(id=1, name="audit_group")
         self.wf = SqlWorkflow.objects.create(
             workflow_name="some_name",
             group_id=1,
@@ -89,13 +90,13 @@ class TestView(TransactionTestCase):
         self.audit = WorkflowAudit.objects.create(
             group_id=1,
             group_name="some_group",
-            workflow_id=1,
+            workflow_id=self.query_apply.apply_id,
             workflow_type=1,
             workflow_title="申请标题",
             workflow_remark="申请备注",
-            audit_auth_groups="1,2,3",
+            audit_auth_groups=str(self.audit_group.id),
             current_audit="1",
-            next_audit="2",
+            next_audit="-1",
             current_status=0,
         )
         self.wl = WorkflowLog.objects.create(
@@ -103,9 +104,31 @@ class TestView(TransactionTestCase):
         )
         # 慢查询建表
         with connection.cursor() as cursor:
-            with open("src/init_sql/mysql_slow_query_review.sql") as fp:
-                content = fp.read()
-                cursor.execute(content)
+            if connection.vendor == "sqlite":
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS mysql_slow_query_review (
+                        checksum TEXT PRIMARY KEY,
+                        fingerprint TEXT,
+                        sample TEXT,
+                        first_seen TEXT,
+                        last_seen TEXT,
+                        reviewed_by TEXT,
+                        reviewed_on TEXT,
+                        comments TEXT
+                    )
+                    """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS mysql_slow_query_review_history (
+                        checksum TEXT,
+                        sample TEXT,
+                        ts_min TEXT,
+                        ts_max TEXT
+                    )
+                    """)
+            else:
+                with open("src/init_sql/mysql_slow_query_review.sql") as fp:
+                    content = fp.read()
+                    cursor.execute(content)
 
     def tearDown(self):
         self.sys_config.purge()
@@ -116,10 +139,15 @@ class TestView(TransactionTestCase):
         WorkflowLog.objects.all().delete()
         QueryPrivilegesApply.objects.all().delete()
         ResourceGroup.objects.all().delete()
+        Group.objects.all().delete()
         with connection.cursor() as cursor:
-            cursor.execute(
-                "DROP table mysql_slow_query_review,mysql_slow_query_review_history"
-            )
+            if connection.vendor == "sqlite":
+                cursor.execute("DROP TABLE IF EXISTS mysql_slow_query_review")
+                cursor.execute("DROP TABLE IF EXISTS mysql_slow_query_review_history")
+            else:
+                cursor.execute(
+                    "DROP table mysql_slow_query_review,mysql_slow_query_review_history"
+                )
 
     def test_index(self):
         """测试index页面"""
@@ -139,6 +167,20 @@ class TestView(TransactionTestCase):
         data = {}
         r = self.client.get("/sqlworkflow/", data=data)
         self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "function workflowDetailUrl(row)")
+        self.assertContains(r, 'return "/workflow/" + row.audit_id + "/";')
+        self.assertContains(r, 'return "/detail/" + row.id + "/";')
+        self.assertNotContains(r, 'href=\\"/workflow/" + row.audit_id + "/\\"')
+
+    def test_sqlexportworkflow(self):
+        """测试sqlexportworkflow页面"""
+        data = {}
+        r = self.client.get("/sqlexportworkflow/", data=data)
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "function workflowDetailUrl(row)")
+        self.assertContains(r, 'return "/workflow/" + row.audit_id + "/";')
+        self.assertContains(r, 'return "/detail/" + row.id + "/";')
+        self.assertNotContains(r, 'href=\\"/workflow/" + row.audit_id + "/\\"')
 
     def test_submitsql(self):
         """测试submitsql页面"""
@@ -169,6 +211,10 @@ class TestView(TransactionTestCase):
         data = {}
         r = self.client.get("/queryapplylist/", data=data)
         self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "function queryApplyDetailUrl(row)")
+        self.assertContains(r, 'return "/workflow/" + row.audit_id + "/";')
+        self.assertContains(r, 'return "/queryapplydetail/" + row.apply_id + "/";')
+        self.assertNotContains(r, 'href=\\"/workflow/" + row.audit_id + "/\\"')
 
     def test_queryuserprivileges(self):
         """测试queryuserprivileges页面"""
@@ -235,6 +281,10 @@ class TestView(TransactionTestCase):
         data = {}
         r = self.client.get(f"/archive/", data=data)
         self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "function archiveDetailUrl(row)")
+        self.assertContains(r, 'return "/workflow/" + row.audit_id + "/";')
+        self.assertContains(r, 'return "/archive/" + row.id + "/";')
+        self.assertNotContains(r, 'href=\\"/workflow/" + row.audit_id + "/\\"')
 
     def test_config(self):
         """测试config页面"""
@@ -282,7 +332,108 @@ class TestView(TransactionTestCase):
         """测试workflows页面"""
         data = {}
         r = self.client.get(f"/workflow/{self.audit.audit_id}/", data=data)
-        self.assertRedirects(r, f"/queryapplydetail/1/", fetch_redirect_response=False)
+        self.assertEqual(r.status_code, 200)
+        self.assertTemplateUsed(r, "queryapplydetail.html")
+        self.assertEqual(r.context["workflow_detail"], self.query_apply)
+        self.assertEqual(r.context["review_info"].nodes[0].group, self.audit_group)
+        self.assertIn("is_can_review", r.context)
+
+    def test_workflowsdetail_sqlworkflow_renders_detail(self):
+        """统一工单详情直接渲染SQL工单详情页"""
+        workflow_audit = WorkflowAudit.objects.create(
+            group_id=1,
+            group_name="some_group",
+            workflow_id=self.wf.id,
+            workflow_type=WorkflowType.SQL_REVIEW,
+            workflow_title="SQL申请标题",
+            workflow_remark="SQL申请备注",
+            audit_auth_groups=str(self.audit_group.id),
+            current_audit=str(self.audit_group.id),
+            next_audit="-1",
+            current_status=WorkflowStatus.WAITING,
+        )
+        WorkflowLog.objects.create(
+            audit_id=workflow_audit.audit_id,
+            operation_type=WorkflowAction.SUBMIT,
+            operation_info="提交SQL",
+        )
+
+        r = self.client.get(f"/workflow/{workflow_audit.audit_id}/")
+
+        self.assertEqual(r.status_code, 200)
+        self.assertTemplateUsed(r, "detail.html")
+        self.assertEqual(r.context["workflow_detail"], self.wf)
+        self.assertEqual(r.context["audit_id"], workflow_audit.audit_id)
+        self.assertEqual(r.context["review_info"].nodes[0].group, self.audit_group)
+
+    def test_workflowsdetail_offline_download_renders_sql_detail(self):
+        """统一工单详情将离线下载作为SQL工单变体渲染"""
+        self.wf.is_offline_export = True
+        self.wf.export_format = "csv"
+        self.wf.file_name = "offline.zip"
+        self.wf.save(update_fields=["is_offline_export", "export_format", "file_name"])
+        workflow_audit = WorkflowAudit.objects.create(
+            group_id=1,
+            group_name="some_group",
+            workflow_id=self.wf.id,
+            workflow_type=WorkflowType.SQL_REVIEW,
+            workflow_title="数据导出申请",
+            workflow_remark="导出备注",
+            audit_auth_groups=str(self.audit_group.id),
+            current_audit=str(self.audit_group.id),
+            next_audit="-1",
+            current_status=WorkflowStatus.WAITING,
+        )
+
+        r = self.client.get(f"/workflow/{workflow_audit.audit_id}/")
+
+        self.assertEqual(r.status_code, 200)
+        self.assertTemplateUsed(r, "detail.html")
+        self.assertEqual(r.context["workflow_detail"], self.wf)
+        self.assertTrue(r.context["workflow_detail"].is_offline_export)
+
+    def test_workflowsdetail_missing_audit_id_returns_404(self):
+        """不存在的audit_id返回404"""
+        r = self.client.get("/workflow/999999/")
+
+        self.assertEqual(r.status_code, 404)
+
+    def test_detail_autoreviewwrong_keeps_audit_id_for_content(self):
+        """自动审核不通过时仍使用审核ID加载SQL内容"""
+        review_groups = [
+            Group.objects.create(name="audit_group_1"),
+            Group.objects.create(name="audit_group_2"),
+            Group.objects.create(name="audit_group_3"),
+        ]
+        audit_auth_groups = ",".join(str(group.id) for group in review_groups)
+        self.wf.status = "workflow_autoreviewwrong"
+        self.wf.save(update_fields=["status"])
+        workflow_audit = WorkflowAudit.objects.create(
+            group_id=1,
+            group_name="some_group",
+            workflow_id=self.wf.id,
+            workflow_type=WorkflowType.SQL_REVIEW,
+            workflow_title="SQL申请标题",
+            workflow_remark="SQL申请备注",
+            audit_auth_groups=audit_auth_groups,
+            current_audit=str(review_groups[0].id),
+            next_audit=str(review_groups[1].id),
+            current_status=0,
+        )
+        WorkflowLog.objects.create(
+            audit_id=workflow_audit.audit_id,
+            operation_type=WorkflowAction.SUBMIT,
+            operation_info="提交SQL",
+        )
+
+        r = self.client.get(f"/detail/{self.wf.id}/")
+
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(
+            r,
+            f"/api/v1/sql-workflows/{workflow_audit.audit_id}/content/",
+        )
+        self.assertNotContains(r, "/api/v1/sql-workflows/None/content/")
 
     def test_dbaprinciples(self):
         """测试workflows页面"""
@@ -512,9 +663,9 @@ class TestQuery(TransactionTestCase):
         archer_config = SysConfig()
         archer_config.set("disable_star", False)
 
-    @patch("sql.query.user_instances")
-    @patch("sql.query.get_engine")
-    @patch("sql.query.query_priv_check")
+    @patch("sql.services.sqlquery_service.user_instances")
+    @patch("sql.services.sqlquery_service.get_engine")
+    @patch("sql.services.sqlquery_service.query_priv_check")
     def testCorrectSQL(self, _priv_check, _get_engine, _user_instances):
         c = Client()
         some_sql = "select some from some_table limit 100;"
@@ -522,7 +673,7 @@ class TestQuery(TransactionTestCase):
         some_limit = 100
         c.force_login(self.u1)
         r = c.post(
-            "/query/",
+            "/api/v1/sqlquery/execute/",
             data={
                 "instance_name": self.slave1.instance_name,
                 "sql_content": some_sql,
@@ -530,7 +681,8 @@ class TestQuery(TransactionTestCase):
                 "limit_num": some_limit,
             },
         )
-        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], 1)
         c.force_login(self.u2)
         q_result = ResultSet(full_sql=some_sql, rows=["value"])
         q_result.column_list = ["some"]
@@ -542,6 +694,7 @@ class TestQuery(TransactionTestCase):
         }
         _get_engine.return_value.filter_sql.return_value = some_sql
         _get_engine.return_value.query.return_value = q_result
+        _get_engine.return_value.thread_id = None
         _get_engine.return_value.seconds_behind_master = 100
         _priv_check.return_value = {
             "status": 0,
@@ -549,7 +702,7 @@ class TestQuery(TransactionTestCase):
         }
         _user_instances.return_value.get.return_value = self.slave1
         r = c.post(
-            "/query/",
+            "/api/v1/sqlquery/execute/",
             data={
                 "instance_name": self.slave1.instance_name,
                 "sql_content": some_sql,
@@ -570,9 +723,9 @@ class TestQuery(TransactionTestCase):
         self.assertEqual(r_json["data"]["column_list"], ["some"])
         self.assertEqual(r_json["data"]["seconds_behind_master"], 100)
 
-    @patch("sql.query.user_instances")
-    @patch("sql.query.get_engine")
-    @patch("sql.query.query_priv_check")
+    @patch("sql.services.sqlquery_service.user_instances")
+    @patch("sql.services.sqlquery_service.get_engine")
+    @patch("sql.services.sqlquery_service.query_priv_check")
     def testSQLWithoutLimit(self, _priv_check, _get_engine, _user_instances):
         c = Client()
         some_limit = 100
@@ -590,13 +743,15 @@ class TestQuery(TransactionTestCase):
         }
         _get_engine.return_value.filter_sql.return_value = sql_with_limit
         _get_engine.return_value.query.return_value = q_result
+        _get_engine.return_value.thread_id = None
+        _get_engine.return_value.seconds_behind_master = 0
         _priv_check.return_value = {
             "status": 0,
             "data": {"limit_num": 100, "priv_check": True},
         }
         _user_instances.return_value.get.return_value = self.slave1
         r = c.post(
-            "/query/",
+            "/api/v1/sqlquery/execute/",
             data={
                 "instance_name": self.slave1.instance_name,
                 "sql_content": sql_without_limit,
@@ -616,7 +771,7 @@ class TestQuery(TransactionTestCase):
         self.assertEqual(r_json["data"]["rows"], ["value"])
         self.assertEqual(r_json["data"]["column_list"], ["some"])
 
-    @patch("sql.query.query_priv_check")
+    @patch("sql.services.sqlquery_service.query_priv_check")
     def testStarOptionOn(self, _priv_check):
         c = Client()
         c.force_login(self.u2)
@@ -630,7 +785,7 @@ class TestQuery(TransactionTestCase):
         archer_config = SysConfig()
         archer_config.set("disable_star", True)
         r = c.post(
-            "/query/",
+            "/api/v1/sqlquery/execute/",
             data={
                 "instance_name": self.slave1.instance_name,
                 "sql_content": sql_with_star,
@@ -660,7 +815,7 @@ class TestQuery(TransactionTestCase):
             "limit": 14,
             "offset": 0,
         }
-        r = c.get("/query/querylog/", data=data)
+        r = c.get("/api/v1/sqlquery/logs/", data=data)
         self.assertEqual(r.json()["total"], 1)
 
     def test_star(self):
@@ -668,7 +823,7 @@ class TestQuery(TransactionTestCase):
         c = Client()
         c.force_login(self.superuser1)
         r = c.post(
-            "/query/favorite/",
+            "/api/v1/sqlquery/favorites/",
             data={
                 "query_log_id": self.query_log.id,
                 "star": "true",
@@ -684,7 +839,7 @@ class TestQuery(TransactionTestCase):
         c = Client()
         c.force_login(self.superuser1)
         r = c.post(
-            "/query/favorite/",
+            "/api/v1/sqlquery/favorites/",
             data={"query_log_id": self.query_log.id, "star": "false", "alias": ""},
         )
         r_json = r.json()
@@ -789,233 +944,6 @@ class TestWorkflowView(TransactionTestCase):
         self.superuser1.delete()
         self.resource_group1.delete()
         SysConfig().purge()
-
-    def testWorkflowStatus(self):
-        """测试获取工单状态"""
-        c = Client(header={})
-        c.force_login(self.u1)
-        r = c.post("/getWorkflowStatus/", {"workflow_id": self.wf1.id})
-        r_json = r.json()
-        self.assertEqual(r_json["status"], "workflow_finish")
-
-    @patch("sql.utils.workflow_audit.Audit.can_review")
-    def test_alter_run_date_no_perm(self, _can_review):
-        """测试修改可执行时间，无权限"""
-        sql_review = Permission.objects.get(codename="sql_review")
-        self.u1.user_permissions.add(sql_review)
-        _can_review.return_value = False
-        c = Client()
-        c.force_login(self.u1)
-        data = {"workflow_id": self.wf1.id}
-        r = c.post("/alter_run_date/", data=data)
-        self.assertContains(r, "你无权操作当前工单")
-
-    @patch("sql.utils.workflow_audit.Audit.can_review")
-    def test_alter_run_date(self, _can_review):
-        """测试修改可执行时间，有权限"""
-        sql_review = Permission.objects.get(codename="sql_review")
-        self.u1.user_permissions.add(sql_review)
-        _can_review.return_value = True
-        c = Client()
-        c.force_login(self.u1)
-        data = {"workflow_id": self.wf1.id}
-        r = c.post("/alter_run_date/", data=data)
-        self.assertRedirects(
-            r, f"/detail/{self.wf1.id}/", fetch_redirect_response=False
-        )
-
-    def testWorkflowListView(self):
-        """测试工单列表"""
-        c = Client()
-        c.force_login(self.superuser1)
-        r = c.post("/sqlworkflow_list/", {"limit": 10, "offset": 0, "navStatus": ""})
-        r_json = r.json()
-        self.assertEqual(r_json["total"], 2)
-        # 列表按创建时间倒序排列, 第二个是wf1 , 是已正常结束
-        self.assertEqual(r_json["rows"][1]["status"], "workflow_finish")
-
-        # u1拿到u1的
-        c.force_login(self.u1)
-        r = c.post("/sqlworkflow_list/", {"limit": 10, "offset": 0, "navStatus": ""})
-        r_json = r.json()
-        self.assertEqual(r_json["total"], 1)
-        self.assertEqual(r_json["rows"][0]["id"], self.wf1.id)
-
-        # u3拿到None
-        c.force_login(self.u3)
-        r = c.post("/sqlworkflow_list/", {"limit": 10, "offset": 0, "navStatus": ""})
-        r_json = r.json()
-        self.assertEqual(r_json["total"], 0)
-
-    def testWorkflowListViewFilter(self):
-        """测试工单列表筛选"""
-        c = Client()
-        c.force_login(self.superuser1)
-        # 工单状态
-        r = c.post(
-            "/sqlworkflow_list/",
-            {"limit": 10, "offset": 0, "navStatus": "workflow_finish"},
-        )
-        r_json = r.json()
-        self.assertEqual(r_json["total"], 1)
-        # 列表按创建时间倒序排列
-        self.assertEqual(r_json["rows"][0]["status"], "workflow_finish")
-
-        # 实例
-        r = c.post(
-            "/sqlworkflow_list/",
-            {"limit": 10, "offset": 0, "instance_id": self.wf1.instance_id},
-        )
-        r_json = r.json()
-        self.assertEqual(r_json["total"], 2)
-        # 列表按创建时间倒序排列, 第二个是wf1
-        self.assertEqual(r_json["rows"][1]["workflow_name"], self.wf1.workflow_name)
-
-        # 资源组
-        r = c.post(
-            "/sqlworkflow_list/",
-            {"limit": 10, "offset": 0, "resource_group_id": self.wf1.group_id},
-        )
-        r_json = r.json()
-        self.assertEqual(r_json["total"], 2)
-        # 列表按创建时间倒序排列, 第二个是wf1
-        self.assertEqual(r_json["rows"][1]["workflow_name"], self.wf1.workflow_name)
-
-        # 时间
-        start_date = datetime.strftime(self.now, "%Y-%m-%d")
-        end_date = datetime.strftime(self.now, "%Y-%m-%d")
-        r = c.post(
-            "/sqlworkflow_list/",
-            {"limit": 10, "offset": 0, "start_date": start_date, "end_date": end_date},
-        )
-        r_json = r.json()
-        self.assertEqual(r_json["total"], 2)
-
-    @patch("sql.sql_workflow.async_task")
-    @patch("sql.notify.auto_notify")
-    @patch("sql.utils.workflow_audit.AuditV2.operate")
-    def testWorkflowPassedView(self, mock_operate, _auto_notify, mock_async_task):
-        """测试审核工单"""
-        c = Client()
-        c.force_login(self.superuser1)
-        r = c.post("/passed/")
-        self.assertContains(r, "workflow_id参数为空.")
-        r = c.post("/passed/", {"workflow_id": 999999})
-        self.assertContains(r, "工单不存在")
-        mock_operate.side_effect = AuditException("mock audit failed")
-        r = c.post("/passed/", {"workflow_id": self.wf2.id})
-        self.assertContains(r, "mock audit failed")
-        self.wf2.refresh_from_db()
-        self.assertEqual(self.wf2.status, "workflow_manreviewing")
-        mock_operate.reset_mock(side_effect=True)
-        mock_operate.return_value = None
-        # 因为 operate 被 mock 了, 为了测试审批流通过, 这里把审批流手动设置为通过, 仅 测试 view 层的逻辑
-        # audit operate 的测试由其他测试覆盖
-        self.audit_flow.current_status = WorkflowStatus.PASSED
-        self.audit_flow.save()
-        r = c.post(
-            "/passed/",
-            data={"workflow_id": self.wf2.id, "audit_remark": "some_audit"},
-            follow=False,
-        )
-        self.assertRedirects(
-            r, "/detail/{}/".format(self.wf2.id), fetch_redirect_response=False
-        )
-        self.wf2.refresh_from_db()
-        self.assertEqual(self.wf2.status, "workflow_review_pass")
-        mock_operate.assert_called_once_with(
-            WorkflowAction.PASS, self.superuser1, "some_audit"
-        )
-        mock_async_task.assert_called_once()
-        args, kwargs = mock_async_task.call_args
-        self.assertEqual(kwargs["timeout"], 60)
-        self.assertEqual(kwargs["task_name"], f"sqlreview-pass-{self.wf2.id}")
-        c.force_login(self.u2)
-        r = c.post("/passed/", {"workflow_id": self.wf2.id})
-        self.assertEqual(r.status_code, 403)
-
-    @patch("sql.sql_workflow.notify_for_execute")
-    @patch("sql.sql_workflow.Audit.add_log")
-    @patch("sql.sql_workflow.Audit.detail_by_workflow_id")
-    @patch("sql.sql_workflow.can_execute")
-    def test_workflow_execute(self, mock_can_excute, _, _1, _2):
-        """测试工单执行"""
-        c = Client()
-        c.force_login(self.executor1)
-        r = c.post("/execute/")
-        self.assertContains(r, "workflow_id参数为空.")
-        mock_can_excute.return_value = False
-        r = c.post("/execute/", data={"workflow_id": self.wf2.id})
-        self.assertContains(r, "你无权操作当前工单！")
-        mock_can_excute.return_value = True
-        r = c.post("/execute/", data={"workflow_id": self.wf2.id, "mode": "manual"})
-        self.wf2.refresh_from_db()
-        self.assertEqual("workflow_finish", self.wf2.status)
-
-    @patch("sql.sql_workflow.Audit.add_log")
-    @patch("sql.notify.auto_notify")
-    @patch("sql.utils.workflow_audit.AuditV2.operate")
-    # patch view里的can_cancel 而不是原始位置的can_cancel ,因为在调用时, 已经 import 了真的 can_cancel ,会导致mock失效
-    # 在import 静态函数时需要注意这一点, 动态对象因为每次都会重新生成,也可以 mock 原函数/方法/对象
-    # 参见 : https://docs.python.org/3/library/unittest.mock.html#where-to-patch
-    @patch("sql.sql_workflow.can_cancel")
-    def testWorkflowCancelView(
-        self, _can_cancel, mock_audit_operate, mock_notify, _add_log
-    ):
-        """测试工单驳回、取消"""
-        c = Client()
-        c.force_login(self.u2)
-        r = c.post("/cancel/")
-        self.assertContains(r, "workflow_id参数为空.")
-        r = c.post("/cancel/", data={"workflow_id": self.wf2.id})
-        self.assertContains(r, "终止原因不能为空")
-        _can_cancel.return_value = False
-        mock_audit_operate.return_value = None
-        r = c.post(
-            "/cancel/",
-            data={"workflow_id": self.wf2.id, "cancel_remark": "some_reason"},
-        )
-        self.assertContains(r, "你无权操作当前工单！")
-        _can_cancel.return_value = True
-        _detail_by_id = 123
-        c.post(
-            "/cancel/",
-            data={"workflow_id": self.wf2.id, "cancel_remark": "some_reason"},
-        )
-        self.wf2.refresh_from_db()
-        self.assertEqual("workflow_abort", self.wf2.status)
-
-    @patch("sql.sql_workflow.get_engine")
-    def test_osc_control(self, _get_engine):
-        """测试MySQL工单osc控制"""
-        c = Client()
-        c.force_login(self.superuser1)
-        request_data = {
-            "workflow_id": self.wf1.id,
-            "sqlsha1": "sqlsha1",
-            "command": "get",
-        }
-        _get_engine.return_value.osc_control.return_value = ResultSet()
-        r = c.post("/inception/osc_control/", data=request_data, follow=False)
-        self.assertDictEqual(
-            json.loads(r.content), {"total": 0, "rows": [], "msg": None}
-        )
-
-    @patch("sql.sql_workflow.get_engine")
-    def test_osc_control_exception(self, _get_engine):
-        """测试MySQL工单OSC控制异常"""
-        c = Client()
-        c.force_login(self.superuser1)
-        request_data = {
-            "workflow_id": self.wf1.id,
-            "sqlsha1": "sqlsha1",
-            "command": "get",
-        }
-        _get_engine.return_value.osc_control.side_effect = RuntimeError("RuntimeError")
-        r = c.post("/inception/osc_control/", data=request_data, follow=False)
-        self.assertDictEqual(
-            json.loads(r.content), {"total": 0, "rows": [], "msg": "RuntimeError"}
-        )
 
 
 class TestOptimize(TestCase):
@@ -1475,9 +1403,10 @@ class TestBinLog(TestCase):
         r = self.client.post(path="/binlog/my2sql/", data=data)
         self.assertEqual(json.loads(r.content), {"status": 0, "msg": "ok", "data": []})
 
+    @patch("sql.binlog.os.listdir")
     @patch("builtins.open")
     @patch("sql.plugins.plugin.subprocess")
-    def test_my2sql_file(self, _open, _subprocess):
+    def test_my2sql_file(self, _subprocess, _open, _listdir):
         """
         测试保存文件
         :param _subprocess:
@@ -1487,6 +1416,8 @@ class TestBinLog(TestCase):
             "some_stdout",
             "some_stderr",
         )
+        _subprocess.Popen.return_value.returncode = 0
+        _listdir.return_value = ["some_file.sql"]
         self.sys_config.set("my2sql", "/opt/archery/src/plugins/my2sql")
         args = {
             "instance_name": "test_instance",
@@ -1766,7 +1697,7 @@ class TestDataDictionary(TestCase):
         }
         r = self.client.get(path="/data_dictionary/view_list/", data=data)
         self.assertDictEqual(
-            json.loads(r.content), {"status": 1, "msg": "仅MySQL支持该功能"}
+            json.loads(r.content), {"status": 1, "msg": "该数据库类型不支持此功能"}
         )
 
     @patch("sql.data_dictionary.get_engine")
@@ -1907,7 +1838,7 @@ class TestDataDictionary(TestCase):
         }
         r = self.client.get(path="/data_dictionary/event_info/", data=data)
         self.assertDictEqual(
-            json.loads(r.content), {"status": 1, "msg": "仅MySQL支持该功能"}
+            json.loads(r.content), {"status": 1, "msg": "该数据库类型不支持此功能"}
         )
 
     def test_export_instance_does_not_exist(self):

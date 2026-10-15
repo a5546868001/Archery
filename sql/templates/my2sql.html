@@ -85,6 +85,7 @@
                         </div>
                         <div class="form-group">
                             <select id="start_file" class="selectpicker form-control"
+                                    data-live-search="true"
                                     title="起始解析文件:"
                                     required>
                             </select>
@@ -95,6 +96,7 @@
                         </div>
                         <div class="form-group">
                             <select id="end_file" class="selectpicker form-control"
+                                    data-live-search="true"
                                     title="终止解析文件(可选):"
                                     required>
                             </select>
@@ -211,7 +213,7 @@
         $(function () {
             $.ajax({
                 type: "get",
-                url: "/group/user_all_instances/",
+                url: "/api/v1/sqlquery/instances/",
                 dataType: "json",
                 data: {
                     db_type: ['mysql']
@@ -246,7 +248,7 @@
             //获取db_name
             $.ajax({
                 type: "get",
-                url: "/instance/instance_resource/",
+                url: "/api/v1/sqlquery/resources/",
                 dataType: "json",
                 data: {
                     instance_name: $("#instance_name").val(),
@@ -318,7 +320,7 @@
             //将数据通过ajax提交给获取db_name
             $.ajax({
                 type: "get",
-                url: "/instance/instance_resource/",
+                url: "/api/v1/sqlquery/resources/",
                 dataType: "json",
                 data: {
                     instance_name: $("#instance_name").val(),
@@ -449,6 +451,9 @@
                                 detailFormatter: function (index, row) {
                                     var html = [];
                                     $.each(row, function (key, value) {
+                                        if (key === 'extra_info' && value) {
+                                            html.push('<span>' + value + '</span><br>');
+                                        }
                                         if (key === 'sql') {
                                             var sql = window.sqlFormatter.format(value);
                                             //替换所有的换行符
@@ -463,9 +468,6 @@
                                 },
                                 data: data.data,
                                 columns: [{
-
-
-
                                     title: 'SQL',
                                     field: 'sql',
                                     formatter: function (value, row, index) {
@@ -477,8 +479,24 @@
                                         }
                                     }
                                 }, {
+                                    title: 'ExtraInfo',
+                                    field: 'extra_info',
+                                    formatter: function (value, row, index) {
+                                        if (!value) {
+                                            return '';
+                                        }
+                                        if (value.length > 200) {
+                                            return value.substr(0, 150) + '...';
+                                        }
+                                        return value;
+                                    }
+                                }, {
                                     title: '完整SQL',
                                     field: 'sql',
+                                    visible: false // 默认不显示
+                                }, {
+                                    title: '完整ExtraInfo',
+                                    field: 'extra_info',
                                     visible: false // 默认不显示
                                 }],
                                 onLoadSuccess: function () {

@@ -57,6 +57,22 @@ def second_instance(db):
     ins.delete()
 
 
+@pytest.fixture
+def gaussdb_instance(db):
+    ins = Instance.objects.create(
+        instance_name="test_gaussdb",
+        type="master",
+        db_type="gaussdb",
+        host="127.0.0.3",
+        port=5432,
+        user="ins_user",
+        password="some_str",
+        db_name="postgres",
+    )
+    yield ins
+    ins.delete()
+
+
 def response_json(response):
     return json.loads(response.content)
 
@@ -257,6 +273,30 @@ class TestParamList:
             }
         ]
 
+    @patch("sql.instance.get_engine")
+    def test_param_list_seeds_builtin_gaussdb_templates(
+        self, mock_get_engine, client_with_super_user, gaussdb_instance
+    ):
+        mock_get_engine.return_value.get_variables.return_value = ResultSet(
+            rows=(
+                ("statement_timeout", "0"),
+                ("work_mem", "4MB"),
+                ("max_connections", "5000"),
+            )
+        )
+
+        response = client_with_super_user.post(
+            "/param/list/",
+            data={"instance_id": gaussdb_instance.id, "editable": "true"},
+        )
+
+        rows = response_json(response)
+        assert {row["variable_name"] for row in rows} == {
+            "statement_timeout",
+            "work_mem",
+        }
+        assert ParamTemplate.objects.filter(db_type="gaussdb").count() >= 3
+
 
 @pytest.mark.django_db
 class TestParamHistory:
@@ -335,6 +375,60 @@ class TestParamEdit:
                 "instance_id": master_instance.id,
                 "variable_name": "binlog_format",
                 "runtime_value": "ROW",
+            },
+        )
+
+        assert response_json(response) == {
+            "status": 1,
+            "msg": "请先在参数模板中配置该参数！",
+            "data": [],
+        }
+
+    @patch("sql.instance.get_engine")
+    def test_param_edit_rejects_template_from_other_db_type(
+        self, mock_get_engine, client_with_super_user, gaussdb_instance
+    ):
+        ParamTemplate.objects.create(
+            db_type="mysql",
+            variable_name="binlog_format",
+            default_value="ROW",
+            editable=True,
+        )
+        mock_get_engine.return_value.escape_string.side_effect = lambda value: value
+
+        response = client_with_super_user.post(
+            "/param/edit/",
+            data={
+                "instance_id": gaussdb_instance.id,
+                "variable_name": "binlog_format",
+                "runtime_value": "STATEMENT",
+            },
+        )
+
+        assert response_json(response) == {
+            "status": 1,
+            "msg": "请先在参数模板中配置该参数！",
+            "data": [],
+        }
+
+    @patch("sql.instance.get_engine")
+    def test_param_edit_rejects_non_editable_template(
+        self, mock_get_engine, client_with_super_user, master_instance
+    ):
+        ParamTemplate.objects.create(
+            db_type="mysql",
+            variable_name="max_connections",
+            default_value="151",
+            editable=False,
+        )
+        mock_get_engine.return_value.escape_string.side_effect = lambda value: value
+
+        response = client_with_super_user.post(
+            "/param/edit/",
+            data={
+                "instance_id": master_instance.id,
+                "variable_name": "max_connections",
+                "runtime_value": "200",
             },
         )
 
@@ -742,259 +836,5 @@ class TestSchemaSync:
                 "diff_stdout": "执行对比命令失败，请联系管理员",
                 "patch_stdout": "读取对比结果文件失败，请联系管理员",
                 "revert_stdout": "读取对比结果文件失败，请联系管理员",
-            },
-        }
-
-
-@pytest.mark.django_db
-class TestInstanceResource:
-    def test_instance_resource_rejects_invalid_instance_id(
-        self, client_with_super_user
-    ):
-        response = client_with_super_user.get(
-            "/instance/instance_resource/",
-            data={"instance_id": "x", "resource_type": "database"},
-        )
-
-        assert response_json(response) == {
-            "status": 1,
-            "msg": "实例ID不合法",
-            "data": [],
-        }
-
-    def test_instance_resource_instance_not_exist(self, client_with_super_user):
-        response = client_with_super_user.get(
-            "/instance/instance_resource/",
-            data={"instance_name": "missing", "resource_type": "database"},
-        )
-
-        assert response_json(response) == {
-            "status": 1,
-            "msg": "实例不存在",
-            "data": [],
-        }
-
-    @patch("sql.instance.get_engine")
-    def test_instance_resource_database_filters_names(
-        self, mock_get_engine, client_with_super_user, master_instance
-    ):
-        engine = make_engine()
-        engine.instance = master_instance
-        engine.get_all_databases.return_value = ResultSet(
-            rows=["app_main", "app_secret", "mysql"]
-        )
-        mock_get_engine.return_value = engine
-
-        response = client_with_super_user.get(
-            "/instance/instance_resource/",
-            data={"instance_id": master_instance.id, "resource_type": "database"},
-        )
-
-        assert response_json(response) == {
-            "status": 0,
-            "msg": "ok",
-            "data": ["app_main"],
-        }
-
-    @patch("sql.instance.get_engine")
-    def test_instance_resource_schema_table_and_column_branches(
-        self, mock_get_engine, client_with_super_user, master_instance
-    ):
-        engine = make_engine()
-        engine.get_all_schemas.return_value = ResultSet(rows=["public"])
-        engine.get_all_tables.return_value = ResultSet(rows=["t1"])
-        engine.get_all_columns_by_tb.return_value = ResultSet(rows=["c1"])
-        mock_get_engine.return_value = engine
-
-        schema_response = client_with_super_user.get(
-            "/instance/instance_resource/",
-            data={
-                "instance_name": master_instance.instance_name,
-                "resource_type": "schema",
-                "db_name": "app",
-            },
-        )
-        table_response = client_with_super_user.get(
-            "/instance/instance_resource/",
-            data={
-                "instance_name": master_instance.instance_name,
-                "resource_type": "table",
-                "db_name": "app",
-                "schema_name": "public",
-            },
-        )
-        column_response = client_with_super_user.get(
-            "/instance/instance_resource/",
-            data={
-                "instance_name": master_instance.instance_name,
-                "resource_type": "column",
-                "db_name": "app",
-                "schema_name": "public",
-                "tb_name": "t1",
-            },
-        )
-
-        assert response_json(schema_response)["data"] == ["public"]
-        assert response_json(table_response)["data"] == ["t1"]
-        assert response_json(column_response)["data"] == ["c1"]
-        engine.get_all_schemas.assert_called_once_with(db_name="app")
-        engine.get_all_tables.assert_called_once_with(
-            db_name="app", schema_name="public"
-        )
-        engine.get_all_columns_by_tb.assert_called_once_with(
-            db_name="app", tb_name="t1", schema_name="public"
-        )
-
-    @patch("sql.instance.get_engine")
-    def test_instance_resource_result_error(
-        self, mock_get_engine, client_with_super_user, master_instance
-    ):
-        engine = make_engine()
-        engine.instance = master_instance
-        engine.get_all_databases.return_value = result_set_error("query failed")
-        mock_get_engine.return_value = engine
-
-        response = client_with_super_user.get(
-            "/instance/instance_resource/",
-            data={"instance_id": master_instance.id, "resource_type": "database"},
-        )
-
-        assert response_json(response) == {
-            "status": 1,
-            "msg": "query failed",
-            "data": [],
-        }
-
-    @patch("sql.instance.get_engine")
-    def test_instance_resource_engine_exception(
-        self, mock_get_engine, client_with_super_user, master_instance
-    ):
-        mock_get_engine.side_effect = RuntimeError("boom")
-
-        response = client_with_super_user.get(
-            "/instance/instance_resource/",
-            data={"instance_id": master_instance.id, "resource_type": "database"},
-        )
-
-        assert response_json(response) == {
-            "status": 1,
-            "msg": "获取实例资源失败，请联系管理员",
-            "data": [],
-        }
-
-    @patch("sql.instance.get_engine")
-    def test_instance_resource_unsupported_type(
-        self, mock_get_engine, client_with_super_user, master_instance
-    ):
-        mock_get_engine.return_value = make_engine()
-
-        response = client_with_super_user.get(
-            "/instance/instance_resource/",
-            data={"instance_id": master_instance.id, "resource_type": "unknown"},
-        )
-
-        assert response_json(response) == {
-            "status": 1,
-            "msg": "获取实例资源失败，请联系管理员",
-            "data": [],
-        }
-
-
-@pytest.mark.django_db
-class TestDescribe:
-    def test_describe_instance_not_exist(self, client_with_super_user):
-        response = client_with_super_user.post(
-            "/instance/describetable/",
-            data={"instance_name": "missing", "db_name": "app", "tb_name": "t1"},
-        )
-
-        assert response_json(response) == {
-            "status": 1,
-            "msg": "实例不存在",
-            "data": [],
-        }
-
-    @patch("sql.instance.get_engine")
-    def test_describe_success(
-        self, mock_get_engine, client_with_super_user, master_instance
-    ):
-        query_result = ResultSet(rows=[("id", "int")], column_list=["Field", "Type"])
-        engine = make_engine()
-        engine.describe_table.return_value = query_result
-        mock_get_engine.return_value = engine
-
-        response = client_with_super_user.post(
-            "/instance/describetable/",
-            data={
-                "instance_name": master_instance.instance_name,
-                "db_name": "app",
-                "schema_name": "public",
-                "tb_name": "t1",
-            },
-        )
-
-        result = response_json(response)
-        assert result["status"] == 0
-        assert result["msg"] == "ok"
-        assert result["data"]["rows"] == [["id", "int"]]
-        assert result["data"]["column_list"] == ["Field", "Type"]
-        engine.describe_table.assert_called_once_with("app", "t1", schema_name="public")
-
-    @patch("sql.instance.get_engine")
-    def test_describe_engine_exception_keeps_current_attribute_error(
-        self, mock_get_engine, client_with_super_user, master_instance
-    ):
-        mock_get_engine.side_effect = RuntimeError("boom")
-
-        request = RequestFactory().post(
-            "/instance/describetable/",
-            data={
-                "instance_name": master_instance.instance_name,
-                "db_name": "app",
-                "schema_name": "public",
-                "tb_name": "t1",
-            },
-        )
-
-        with pytest.raises(AttributeError):
-            instance_views.describe(request)
-
-    @patch("sql.instance.get_engine")
-    def test_describe_result_error(
-        self, mock_get_engine, client_with_super_user, master_instance
-    ):
-        engine = make_engine()
-        engine.describe_table.return_value = result_set_error("table not found")
-        mock_get_engine.return_value = engine
-
-        response = client_with_super_user.post(
-            "/instance/describetable/",
-            data={
-                "instance_name": master_instance.instance_name,
-                "db_name": "app",
-                "schema_name": "public",
-                "tb_name": "missing",
-            },
-        )
-
-        assert response_json(response) == {
-            "status": 1,
-            "msg": "table not found",
-            "data": {
-                "full_sql": "",
-                "is_execute": False,
-                "checked": None,
-                "is_masked": False,
-                "query_time": "",
-                "mask_rule_hit": False,
-                "mask_time": "",
-                "warning": None,
-                "error": "table not found",
-                "is_critical": False,
-                "rows": [],
-                "column_list": [],
-                "column_type": [],
-                "status": None,
-                "affected_rows": 0,
             },
         }

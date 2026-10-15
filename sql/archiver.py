@@ -20,7 +20,6 @@ from django.db.models import Q, Value as V, TextField
 from django.db.models.functions import Concat
 from django.http import HttpResponse, JsonResponse, HttpResponseRedirect
 from django.shortcuts import render
-from django.urls import reverse
 from django_q.tasks import async_task
 
 from common.utils.const import WorkflowStatus, WorkflowType, WorkflowAction
@@ -30,7 +29,7 @@ from sql.engines import get_engine
 from sql.notify import notify_for_audit
 from sql.plugins.pt_archiver import PtArchiver
 from sql.utils.resource_group import user_instances, user_groups
-from sql.models import ArchiveConfig, ArchiveLog, Instance, ResourceGroup
+from sql.models import ArchiveConfig, ArchiveLog, Instance, ResourceGroup, WorkflowAudit
 from sql.utils.workflow_audit import get_auditor, AuditException, Audit
 
 logger = logging.getLogger("default")
@@ -105,6 +104,15 @@ def archive_list(request):
 
     # QuerySet 序列化
     rows = [row for row in lists]
+    audit_by_workflow_id = {
+        audit.workflow_id: audit.audit_id
+        for audit in WorkflowAudit.objects.filter(
+            workflow_type=WorkflowType.ARCHIVE,
+            workflow_id__in=[row["id"] for row in rows],
+        )
+    }
+    for row in rows:
+        row["audit_id"] = audit_by_workflow_id.get(row["id"])
 
     result = {"total": count, "rows": rows}
     # 返回查询结果
@@ -207,7 +215,7 @@ def archive_apply(request):
         try:
             audit_handler.create_audit()
         except AuditException as e:
-            logger.error(f"新建审批流失败: {str(e)}")
+            logger.info("新建审批流失败, reason=%s", e)
             return JsonResponse(
                 {"status": 1, "msg": "新建审批流失败, 请联系管理员", "data": {}}
             )
@@ -270,7 +278,7 @@ def archive_audit(request):
                 audit_status, request.user, audit_remark
             )
         except AuditException as e:
-            return render(request, "error.html", {"errMsg": f"审核失败: {str(e)}"})
+            return render(request, "error.html", {"errMsg": f"审核失败: {e}"})
         auditor.workflow.status = auditor.audit.current_status
         if auditor.audit.current_status == WorkflowStatus.PASSED:
             auditor.workflow.state = True
@@ -283,7 +291,7 @@ def archive_audit(request):
         task_name=f"archive-audit-{archive_id}",
     )
 
-    return HttpResponseRedirect(reverse("sql:archive_detail", args=(archive_id,)))
+    return HttpResponseRedirect(f"/workflow/{auditor.audit.audit_id}/")
 
 
 def add_archive_task(archive_ids=None):

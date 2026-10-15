@@ -16,7 +16,7 @@ from sql.utils.sql_utils import (
     get_exec_sqlitem_list,
 )
 from . import EngineBase
-import cx_Oracle
+import oracledb
 from .models import ResultSet, ReviewSet, ReviewResult
 from sql.utils.data_masking import simple_column_mask
 
@@ -36,16 +36,14 @@ class OracleEngine(EngineBase):
         if self.conn:
             return self.conn
         if self.sid:
-            dsn = cx_Oracle.makedsn(self.host, self.port, self.sid)
-            self.conn = cx_Oracle.connect(
-                self.user, self.password, dsn=dsn, encoding="UTF-8", nencoding="UTF-8"
+            dsn = oracledb.makedsn(self.host, self.port, self.sid)
+            self.conn = oracledb.connect(
+                user=self.user, password=self.password, dsn=dsn
             )
         elif self.service_name:
-            dsn = cx_Oracle.makedsn(
-                self.host, self.port, service_name=self.service_name
-            )
-            self.conn = cx_Oracle.connect(
-                self.user, self.password, dsn=dsn, encoding="UTF-8", nencoding="UTF-8"
+            dsn = oracledb.makedsn(self.host, self.port, service_name=self.service_name)
+            self.conn = oracledb.connect(
+                user=self.user, password=self.password, dsn=dsn
             )
         else:
             raise ValueError("sid 和 dsn 均未填写, 请联系管理页补充该实例配置.")
@@ -54,6 +52,11 @@ class OracleEngine(EngineBase):
     name = "Oracle"
 
     info = "Oracle engine"
+
+    @staticmethod
+    def escape_string(value: str) -> str:
+        """Oracle参数转义，防止单引号注入"""
+        return str(value).replace("'", "''")
 
     @property
     def auto_backup(self):
@@ -696,9 +699,9 @@ class OracleEngine(EngineBase):
                 sql = f"select PLAN_TABLE_OUTPUT from table(dbms_xplan.display)"
             cursor.execute(sql, parameters or [])
             fields = cursor.description
-            if any(x[1] == cx_Oracle.CLOB for x in fields):
+            if any(x[1] == oracledb.DB_TYPE_CLOB for x in fields):
                 rows = [
-                    tuple([(c.read() if type(c) == cx_Oracle.LOB else c) for c in r])
+                    tuple([(c.read() if type(c) == oracledb.LOB else c) for c in r])
                     for r in cursor
                 ]
                 if int(limit_num) > 0:
@@ -1431,9 +1434,9 @@ class OracleEngine(EngineBase):
             )
             cursor.execute(get_task_sql, {"task_name": task_name})
             fields = cursor.description
-            if any(x[1] == cx_Oracle.CLOB for x in fields):
+            if any(x[1] == oracledb.DB_TYPE_CLOB for x in fields):
                 rows = [
-                    tuple([(c.read() if type(c) == cx_Oracle.LOB else c) for c in r])
+                    tuple([(c.read() if type(c) == oracledb.LOB else c) for c in r])
                     for r in cursor
                 ]
             else:
@@ -1548,9 +1551,15 @@ class OracleEngine(EngineBase):
             kill_sql = kill_sql + row[0]
         return self.execute(sql=kill_sql)
 
-    def tablespace(self, offset=0, row_count=14):
+    def tablespace(self, offset=0, row_count=14, schema_search=""):
         """获取表空间信息"""
         row_count = offset + row_count
+        search_condition = ""
+        if schema_search:
+            search_escaped = self.escape_string(schema_search)
+            search_condition = " AND a.tablespace_name LIKE '%{keyword}%'".format(
+                keyword=search_escaped
+            )
         sql = """
         select f.* from (
             select rownum rownumber, e.* from (
@@ -1563,17 +1572,25 @@ class OracleEngine(EngineBase):
                 from sys.sm$ts_avail a, sys.sm$ts_used b, sys.sm$ts_free c, dba_tablespaces d
                 where a.tablespace_name = b.tablespace_name
                 and a.tablespace_name = c.tablespace_name
-                and a.tablespace_name = d.tablespace_name
+                and a.tablespace_name = d.tablespace_name{search_condition}
                 order by total_space desc ) e
                 where rownum <=:row_count
-        ) f where f.rownumber >=:offset;"""
+        ) f where f.rownumber >=:offset;""".format(search_condition=search_condition)
         return self.query(
             sql=sql, parameters={"row_count": row_count, "offset": offset}
         )
 
-    def tablespace_count(self):
+    def tablespace_count(self, schema_search=""):
         """获取表空间数量"""
-        sql = """select count(*) from dba_tablespaces where contents != 'TEMPORARY'"""
+        search_condition = ""
+        if schema_search:
+            search_escaped = self.escape_string(schema_search)
+            search_condition = " AND tablespace_name LIKE '%{keyword}%'".format(
+                keyword=search_escaped
+            )
+        sql = """select count(*) from dba_tablespaces where contents != 'TEMPORARY'{search_condition}""".format(
+            search_condition=search_condition
+        )
         return self.query(sql=sql)
 
     def lock_info(self):

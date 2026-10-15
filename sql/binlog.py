@@ -2,6 +2,8 @@
 import MySQLdb
 import logging
 import os
+import shutil
+import tempfile
 import time
 import traceback
 import shlex
@@ -20,6 +22,40 @@ from sql.notify import notify_for_my2sql
 from .models import Instance
 
 logger = logging.getLogger("default")
+
+
+def parse_my2sql_output_line(line, current_extra_info):
+    output_line = line.rstrip("\r\n")
+    content = output_line.lstrip()
+    if content.startswith("#"):
+        return None, content
+    if content[0:6].upper() in ("INSERT", "DELETE", "UPDATE"):
+        sql = content if content.endswith(";") else content + ";"
+        row_info = {"sql": sql}
+        if current_extra_info:
+            row_info["extra_info"] = current_extra_info
+        return row_info, current_extra_info
+    return None, current_extra_info
+
+
+def read_my2sql_output_files(output_dir, num):
+    rows = []
+    current_extra_info = ""
+    for root, _, files in os.walk(output_dir):
+        for file_name in sorted(files):
+            if not file_name.endswith(".sql") or file_name.startswith("."):
+                continue
+            file_path = os.path.join(root, file_name)
+            with open(file_path, encoding="utf-8") as sql_file:
+                for line in sql_file:
+                    row_info, current_extra_info = parse_my2sql_output_line(
+                        line, current_extra_info
+                    )
+                    if row_info:
+                        rows.append(row_info)
+                        if len(rows) >= num:
+                            return rows
+    return rows
 
 
 @permission_required("sql.menu_my2sql", raise_exception=True)
@@ -68,8 +104,9 @@ def del_binlog(request):
 
     if binlog:
         query_engine = get_engine(instance=instance)
-        binlog = query_engine.escape_string(binlog)
-        query_result = query_engine.query(sql=rf"purge master logs to '{binlog}';")
+        query_result = query_engine.query(
+            sql="purge master logs to %s;", parameters=(binlog,)
+        )
         if query_result.error is None:
             result = {"status": 0, "msg": "清理成功", "data": ""}
         else:
@@ -136,6 +173,11 @@ def my2sql(request):
     my2sql = My2SQL()
     username, password = instance.get_username_password()
     # 准备参数
+    temp_output_dir = tempfile.mkdtemp(prefix="my2sql_preview_")
+    output_to_screen = True
+    if extra_info:
+        output_to_screen = False
+
     args = {
         "host": instance.host,
         "user": username,
@@ -157,7 +199,8 @@ def my2sql(request):
         "full-columns": full_columns,
         "do-not-add-prifixDb": no_db_prefix,
         "file-per-table": file_per_table,
-        "output-toScreen": True,
+        "output-toScreen": output_to_screen,
+        "output-dir": temp_output_dir,
     }
 
     # 参数检查
@@ -171,34 +214,52 @@ def my2sql(request):
 
     # 执行命令
     try:
-        p = my2sql.execute_cmd(cmd_args)
-        # 读取前num行后结束
         rows = []
-        n = 1
-        for line in iter(p.stdout.readline, ""):
-            if n <= num and isinstance(line, str):
-                if line[0:6].upper() in ("INSERT", "DELETE", "UPDATE"):
-                    n = n + 1
-                    row_info = {}
-                    row_info["sql"] = line.rstrip("\r\n") + ";"
-                    rows.append(row_info)
-            else:
-                break
+        stderr = ""
+        p = my2sql.execute_cmd(cmd_args)
+        if extra_info:
+            _, stderr = p.communicate()
+            rows = read_my2sql_output_files(temp_output_dir, num)
+        else:
+            # 读取前num行后结束
+            n = 1
+            current_extra_info = ""
+            for line in iter(p.stdout.readline, ""):
+                if n <= num and isinstance(line, str):
+                    row_info, current_extra_info = parse_my2sql_output_line(
+                        line, current_extra_info
+                    )
+                    if row_info:
+                        n = n + 1
+                        rows.append(row_info)
+                else:
+                    break
 
-        if rows.__len__() == 0:
-            # 判断是否有异常
-            stderr = p.stderr.read()
-            if stderr and isinstance(stderr, str):
-                result["status"] = 1
-                result["msg"] = stderr
-                return HttpResponse(json.dumps(result), content_type="application/json")
-        # 终止子进程
-        p.kill()
+            if rows.__len__() == 0:
+                # 判断是否有异常
+                stderr = p.stderr.read()
+                if stderr and isinstance(stderr, str):
+                    result["status"] = 1
+                    result["msg"] = stderr
+                    return HttpResponse(
+                        json.dumps(result), content_type="application/json"
+                    )
+            # 终止子进程
+            p.kill()
+
+        if rows.__len__() == 0 and stderr and isinstance(stderr, str):
+            result["status"] = 1
+            result["msg"] = stderr
+            return HttpResponse(json.dumps(result), content_type="application/json")
+
         result["data"] = rows
     except Exception as e:
         logger.error(traceback.format_exc())
         result["status"] = 1
         result["msg"] = str(e)
+    finally:
+        if temp_output_dir:
+            shutil.rmtree(temp_output_dir, ignore_errors=True)
 
     # 异步保存到文件
     if save_sql:
@@ -208,8 +269,8 @@ def my2sql(request):
         async_task(
             my2sql_file,
             args=args,
-            user=request.user,
-            hook=notify_for_my2sql,
+            user=request.user.username,
+            hook="sql.notify.notify_for_my2sql",
             timeout=-1,
             task_name=f"my2sql-{time.time()}",
         )
@@ -230,20 +291,38 @@ def my2sql_file(args, user):
     """
     my2sql = My2SQL()
     instance = args.pop("instance")
+
+    # 应该获取解密后的账号密码
+    username, password = instance.get_username_password()
+
     args.update(
         {
             "host": instance.host,
-            "user": instance.user,
-            "password": instance.password,
+            "user": username,
+            "password": password,
             "port": instance.port,
         }
     )
-    path = os.path.join(settings.BASE_DIR, "downloads/my2sql/")
+
+    # 每次生成唯一的目录，避免目录非空导致 my2sql 失败
+    dir_name = f"{instance.host}_{int(time.time())}"
+    path = os.path.join(settings.BASE_DIR, "downloads", "my2sql", dir_name)
     os.makedirs(path, exist_ok=True)
 
     # 参数转换
     args["output-dir"] = path
     cmd_args = my2sql.generate_args2cmd(args)
     # 使用output-dir参数执行命令保存sql
-    my2sql.execute_cmd(cmd_args)
+    p = my2sql.execute_cmd(cmd_args)
+    stdout, stderr = p.communicate()
+
+    if p.returncode != 0:
+        logger.error(f"my2sql_file execute failed, stderr: {stderr}, stdout: {stdout}")
+        raise RuntimeError(f"my2sql执行失败，错误信息: {stderr or stdout}")
+
+    # 如果执行成功，但目录下没有任何文件，可能是 my2sql 工具校验失败（比如参数错误、目录权限等）导致静默退出
+    if not os.listdir(path):
+        logger.error(f"my2sql_file output empty, stderr: {stderr}, stdout: {stdout}")
+        raise RuntimeError(f"my2sql执行成功但未生成文件，可能静默失败，输出: {stdout}")
+
     return user, path

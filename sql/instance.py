@@ -13,11 +13,82 @@ from django.views.decorators.cache import cache_page
 from common.utils.extend_json_encoder import ExtendJSONEncoder
 from common.utils.convert import Convert
 from sql.engines import get_engine
+from sql.services.resource_service import list_instance_resources
 from sql.plugins.schemasync import SchemaSync
 from sql.utils.sql_utils import filter_db_list
 from .models import Instance, ParamTemplate, ParamHistory
 
 logger = logging.getLogger("default")
+
+
+GAUSSDB_PARAM_TEMPLATES = [
+    {
+        "variable_name": "statement_timeout",
+        "default_value": "0",
+        "editable": True,
+        "valid_values": "[0-2147483647]",
+        "description": "单条语句最大执行时间，单位毫秒；0 表示不限制。",
+    },
+    {
+        "variable_name": "lockwait_timeout",
+        "default_value": "1200000",
+        "editable": True,
+        "valid_values": "[0-2147483647]",
+        "description": "等待锁的超时时间，单位毫秒。",
+    },
+    {
+        "variable_name": "work_mem",
+        "default_value": "4MB",
+        "editable": True,
+        "valid_values": "内存大小，例如 4MB、64MB。",
+        "description": "排序、哈希等操作可使用的工作内存。",
+    },
+    {
+        "variable_name": "enable_seqscan",
+        "default_value": "on",
+        "editable": True,
+        "valid_values": "[on|off]",
+        "description": "控制优化器是否启用顺序扫描计划。",
+    },
+    {
+        "variable_name": "enable_indexscan",
+        "default_value": "on",
+        "editable": True,
+        "valid_values": "[on|off]",
+        "description": "控制优化器是否启用索引扫描计划。",
+    },
+    {
+        "variable_name": "max_connections",
+        "default_value": "5000",
+        "editable": False,
+        "valid_values": "需重启或通过实例参数组维护。",
+        "description": "实例最大连接数。",
+    },
+    {
+        "variable_name": "shared_buffers",
+        "default_value": "128MB",
+        "editable": False,
+        "valid_values": "需重启或通过实例参数组维护。",
+        "description": "数据库共享缓冲区大小。",
+    },
+]
+
+
+def ensure_builtin_param_templates(db_type):
+    """补齐内置参数模板，避免新引擎在参数页没有可展示项。"""
+    if db_type != "gaussdb":
+        return
+    for param in GAUSSDB_PARAM_TEMPLATES:
+        ParamTemplate.objects.get_or_create(
+            db_type=db_type,
+            variable_name=param["variable_name"],
+            defaults={
+                "default_value": param["default_value"],
+                "editable": param["editable"],
+                "valid_values": param["valid_values"],
+                "description": param["description"],
+            },
+        )
 
 
 @permission_required("sql.menu_instance_list", raise_exception=True)
@@ -97,6 +168,7 @@ def param_list(request):
         logger.error(f"实例不存在：{instance_id}，异常详情：{e}")
         result = {"status": 1, "msg": "实例不存在", "data": []}
         return HttpResponse(json.dumps(result), content_type="application/json")
+    ensure_builtin_param_templates(ins.db_type)
     # 获取已配置参数列表
     cnf_params = dict()
     for param in ParamTemplate.objects.filter(
@@ -192,8 +264,12 @@ def param_edit(request):
     engine = get_engine(instance=ins)
     variable_name = engine.escape_string(variable_name)
     variable_value = engine.escape_string(variable_value)
-    # 校验是否配置模板
-    if not ParamTemplate.objects.filter(variable_name=variable_name).exists():
+    ensure_builtin_param_templates(ins.db_type)
+    # 校验是否配置模板（需匹配 db_type 且 editable=True）
+    param_template = ParamTemplate.objects.filter(
+        db_type=ins.db_type, variable_name=variable_name, editable=True
+    ).first()
+    if not param_template:
         result = {"status": 1, "msg": "请先在参数模板中配置该参数！", "data": []}
         return HttpResponse(json.dumps(result), content_type="application/json")
     # 获取当前运行参数值
@@ -265,8 +341,8 @@ def param_compare(request):
         }
         return HttpResponse(json.dumps(result), content_type="application/json")
 
-    # 校验引擎支持参数对比（仅 mysql / goinception 实现了 get_variables）
-    _variable_supported_db_types = {"mysql", "goinception"}
+    # 校验引擎支持参数对比（mysql / goinception / gaussdb 实现了 get_variables）
+    _variable_supported_db_types = {"mysql", "goinception", "gaussdb"}
     if ins1.db_type not in _variable_supported_db_types:
         result = {
             "status": 1,
@@ -485,107 +561,13 @@ def instance_resource(request):
     :param request:
     :return:
     """
-    instance_id = request.GET.get("instance_id")
-    instance_name = request.GET.get("instance_name")
-    db_name = request.GET.get("db_name", "")
-    schema_name = request.GET.get("schema_name", "")
-    tb_name = request.GET.get("tb_name", "")
-
-    resource_type = request.GET.get("resource_type")
-    if instance_id:
-        # 校验实例ID格式
-        try:
-            int(instance_id)
-        except (TypeError, ValueError) as e:
-            logger.error(f"实例ID不合法：{instance_id}，异常详情：{e}")
-            result = {"status": 1, "msg": "实例ID不合法", "data": []}
-            return HttpResponse(json.dumps(result), content_type="application/json")
-        try:
-            instance = Instance.objects.get(id=instance_id)
-        except Instance.DoesNotExist as e:
-            logger.error(f"实例不存在：{instance_id}，异常详情：{e}")
-            result = {"status": 1, "msg": "实例不存在", "data": []}
-            return HttpResponse(json.dumps(result), content_type="application/json")
-    else:
-        try:
-            instance = Instance.objects.get(instance_name=instance_name)
-        except Instance.DoesNotExist as e:
-            logger.error(f"实例不存在：{instance_name}，异常详情：{e}")
-            result = {"status": 1, "msg": "实例不存在", "data": []}
-            return HttpResponse(json.dumps(result), content_type="application/json")
-    result = {"status": 0, "msg": "ok", "data": []}
-
-    try:
-        query_engine = get_engine(instance=instance)
-        db_name = query_engine.escape_string(db_name)
-        schema_name = query_engine.escape_string(schema_name)
-        tb_name = query_engine.escape_string(tb_name)
-        if resource_type == "database":
-            resource = query_engine.get_all_databases()
-            resource.rows = filter_db_list(
-                db_list=resource.rows,
-                db_name_regex=query_engine.instance.show_db_name_regex,
-                is_match_regex=True,
-            )
-            resource.rows = filter_db_list(
-                db_list=resource.rows,
-                db_name_regex=query_engine.instance.denied_db_name_regex,
-                is_match_regex=False,
-            )
-        elif resource_type == "schema" and db_name:
-            resource = query_engine.get_all_schemas(db_name=db_name)
-        elif resource_type == "table" and db_name:
-            resource = query_engine.get_all_tables(
-                db_name=db_name, schema_name=schema_name
-            )
-        elif resource_type == "column" and db_name and tb_name:
-            resource = query_engine.get_all_columns_by_tb(
-                db_name=db_name, tb_name=tb_name, schema_name=schema_name
-            )
-        else:
-            raise TypeError("不支持的资源类型或者参数不完整！")
-    except Exception as msg:
-        logger.error(f"获取实例资源失败，异常详情：{msg}")
-        result["status"] = 1
-        result["msg"] = "获取实例资源失败，请联系管理员"
-    else:
-        if resource.error:
-            result["status"] = 1
-            result["msg"] = resource.error
-        else:
-            result["data"] = resource.rows
-    return HttpResponse(json.dumps(result), content_type="application/json")
-
-
-def describe(request):
-    """获取表结构"""
-    instance_name = request.POST.get("instance_name")
-    try:
-        instance = Instance.objects.get(instance_name=instance_name)
-    except Instance.DoesNotExist as e:
-        logger.error(f"实例不存在：{instance_name}，异常详情：{e}")
-        result = {"status": 1, "msg": "实例不存在", "data": []}
-        return HttpResponse(json.dumps(result), content_type="application/json")
-    db_name = request.POST.get("db_name")
-    schema_name = request.POST.get("schema_name")
-    tb_name = request.POST.get("tb_name")
-
-    result = {"status": 0, "msg": "ok", "data": []}
-
-    try:
-        query_engine = get_engine(instance=instance)
-        db_name = query_engine.escape_string(db_name)
-        schema_name = query_engine.escape_string(schema_name)
-        tb_name = query_engine.escape_string(tb_name)
-        query_result = query_engine.describe_table(
-            db_name, tb_name, schema_name=schema_name
-        )
-        result["data"] = query_result.__dict__
-    except Exception as msg:
-        logger.error(f"获取表结构失败，异常详情：{msg}")
-        result["status"] = 1
-        result["msg"] = "获取表结构失败，请联系管理员"
-    if result["data"].get("error"):
-        result["status"] = 1
-        result["msg"] = result["data"]["error"]
+    result = list_instance_resources(
+        user=request.user,
+        resource_type=request.GET.get("resource_type"),
+        instance_id=request.GET.get("instance_id"),
+        instance_name=request.GET.get("instance_name"),
+        db_name=request.GET.get("db_name", ""),
+        schema_name=request.GET.get("schema_name", ""),
+        tb_name=request.GET.get("tb_name", ""),
+    )
     return HttpResponse(json.dumps(result), content_type="application/json")

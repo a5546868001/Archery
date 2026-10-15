@@ -17,14 +17,18 @@ from django.db import transaction
 from django.db.models import Q
 from django.http import HttpResponse, HttpResponseRedirect
 from django.shortcuts import render
-from django.urls import reverse
 from django_q.tasks import async_task
 
 from common.config import SysConfig
 from common.utils.const import WorkflowStatus, WorkflowType, WorkflowAction
 from common.utils.extend_json_encoder import ExtendJSONEncoder
-from sql.engines.goinception import GoInceptionEngine
-from sql.models import QueryPrivilegesApply, QueryPrivileges, Instance, ResourceGroup
+from sql.models import (
+    QueryPrivilegesApply,
+    QueryPrivileges,
+    Instance,
+    ResourceGroup,
+    WorkflowAudit,
+)
 from sql.notify import notify_for_audit
 from sql.utils.resource_group import user_groups, user_instances
 from sql.utils.workflow_audit import Audit, AuditException, get_auditor
@@ -99,8 +103,8 @@ def query_priv_check(user, instance, db_name, sql_content, limit_num):
             result["msg"] = f"无法校验查询语句权限，请联系管理员，错误信息：{msg}"
     # 其他类型实例仅校验库权限
     else:
-        # 先获取查询语句涉及的库，redis、mssql、pgsql特殊处理，仅校验当前选择的库
-        if instance.db_type in ["redis", "mssql", "pgsql"]:
+        # 先获取查询语句涉及的库，redis、mssql、pgsql/gaussdb特殊处理，仅校验当前选择的库
+        if instance.db_type in ["redis", "mssql", "pgsql", "gaussdb"]:
             dbs = [db_name]
         else:
             dbs = [
@@ -180,6 +184,15 @@ def query_priv_apply_list(request):
 
     # QuerySet 序列化
     rows = [row for row in lists]
+    audit_by_workflow_id = {
+        audit.workflow_id: audit.audit_id
+        for audit in WorkflowAudit.objects.filter(
+            workflow_type=WorkflowType.QUERY,
+            workflow_id__in=[row["apply_id"] for row in rows],
+        )
+    }
+    for row in rows:
+        row["audit_id"] = audit_by_workflow_id.get(row["apply_id"])
 
     result = {"total": count, "rows": rows}
     # 返回查询结果
@@ -240,6 +253,11 @@ def query_priv_apply(request):
 
     # 库权限
     ins = Instance.objects.get(instance_name=instance_name)
+    if int(priv_type) == 2 and ins.db_type != "mysql":
+        result["status"] = 1
+        result["msg"] = "仅 MySQL 支持表级查询权限申请"
+        return HttpResponse(json.dumps(result), content_type="application/json")
+
     if int(priv_type) == 1:
         # 检查申请账号是否已拥库查询权限
         for db_name in db_list:
@@ -294,7 +312,7 @@ def query_priv_apply(request):
         with transaction.atomic():
             audit_handler.create_audit()
     except AuditException as e:
-        logger.error(f"新建审批流失败, {str(e)}")
+        logger.info("新建审批流失败, reason=%s", e)
         result["status"] = 1
         result["msg"] = "新建审批流失败, 请联系管理员"
         return HttpResponse(json.dumps(result), content_type="application/json")
@@ -383,34 +401,52 @@ def user_query_priv(request):
 @permission_required("sql.query_mgtpriv", raise_exception=True)
 def query_priv_modify(request):
     """
-    变更权限信息
+    变更权限信息，支持单条和批量操作
     :param request:
     :return:
     """
-    privilege_id = request.POST.get("privilege_id")
     type = request.POST.get("type")
     result = {"status": 0, "msg": "ok", "data": []}
 
-    # type=1删除权限,type=2变更权限
-    try:
-        privilege = QueryPrivileges.objects.get(privilege_id=int(privilege_id))
-    except QueryPrivileges.DoesNotExist:
+    # 支持批量操作：privilege_ids 为逗号分隔的 id 列表，privilege_id 为单条操作
+    privilege_ids_str = request.POST.get("privilege_ids", "")
+    privilege_id = request.POST.get("privilege_id", "")
+
+    if privilege_ids_str:
+        try:
+            id_list = [int(i) for i in privilege_ids_str.split(",") if i.strip()]
+        except ValueError:
+            result["msg"] = "privilege_ids 参数格式错误"
+            result["status"] = 1
+            return HttpResponse(json.dumps(result), content_type="application/json")
+    elif privilege_id:
+        try:
+            id_list = [int(privilege_id)]
+        except ValueError:
+            result["msg"] = "privilege_id 参数格式错误"
+            result["status"] = 1
+            return HttpResponse(json.dumps(result), content_type="application/json")
+    else:
+        result["msg"] = "请传入 privilege_id 或 privilege_ids"
+        result["status"] = 1
+        return HttpResponse(json.dumps(result), content_type="application/json")
+
+    privileges = QueryPrivileges.objects.filter(privilege_id__in=id_list)
+    if not privileges.exists():
         result["msg"] = "待操作权限不存在"
         result["status"] = 1
         return HttpResponse(json.dumps(result), content_type="application/json")
 
+    # type=1删除权限,type=2变更权限
     if int(type) == 1:
-        # 删除权限
-        privilege.is_deleted = 1
-        privilege.save(update_fields=["is_deleted"])
+        # 批量删除权限
+        privileges.update(is_deleted=1)
         return HttpResponse(json.dumps(result), content_type="application/json")
     elif int(type) == 2:
-        # 变更权限
+        # 批量变更权限
         valid_date = request.POST.get("valid_date")
         limit_num = request.POST.get("limit_num")
-        privilege.valid_date = valid_date
-        privilege.limit_num = limit_num
-        privilege.save(update_fields=["valid_date", "limit_num"])
+        privileges.update(valid_date=valid_date, limit_num=limit_num)
         return HttpResponse(json.dumps(result), content_type="application/json")
 
 
@@ -446,7 +482,7 @@ def query_priv_audit(request):
                 audit_status, request.user, audit_remark
             )
         except AuditException as e:
-            return render(request, "error.html", {"errMsg": f"审核失败: {str(e)}"})
+            return render(request, "error.html", {"errMsg": f"审核失败: {e}"})
         # 统一 call back, 内部做授权和更新数据库内容
         _query_apply_audit_call_back(
             auditor.audit.workflow_id, auditor.audit.current_status
@@ -461,7 +497,7 @@ def query_priv_audit(request):
         task_name=f"query-priv-audit-{apply_id}",
     )
 
-    return HttpResponseRedirect(reverse("sql:queryapplydetail", args=(apply_id,)))
+    return HttpResponseRedirect(f"/workflow/{auditor.audit.audit_id}/")
 
 
 def _table_ref(sql_content, instance, db_name):
@@ -472,6 +508,8 @@ def _table_ref(sql_content, instance, db_name):
     :param db_name:
     :return:
     """
+    from sql.engines.goinception import GoInceptionEngine
+
     engine = GoInceptionEngine()
     query_tree = engine.query_print(
         instance=instance, db_name=db_name, sql=sql_content

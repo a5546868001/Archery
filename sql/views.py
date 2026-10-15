@@ -7,7 +7,6 @@ from django.contrib.auth.models import Group
 from django.core.exceptions import PermissionDenied
 from django.shortcuts import render, get_object_or_404
 from django.http import HttpResponseRedirect, FileResponse, Http404, JsonResponse
-from django.urls import reverse
 
 from django.conf import settings
 from common.config import SysConfig
@@ -230,13 +229,26 @@ def submit_sql(request):
     return render(request, "sqlsubmit.html", context)
 
 
-def detail(request, workflow_id):
-    """展示SQL工单详细页面"""
+def _sqlworkflow_detail_context(request, workflow_id):
     workflow_detail = get_object_or_404(SqlWorkflow, pk=workflow_id)
     audit_handler = AuditV2(workflow=workflow_detail)
     if not can_view(request.user, workflow_id):
         raise PermissionDenied
     review_info = audit_handler.get_review_info()
+    # The detail page uses audit_id for read-only SQL content/log endpoints even
+    # when operation buttons are disabled, such as autoreview failures.
+    audit_id = None
+    try:
+        audit_detail = Audit.detail_by_workflow_id(
+            workflow_id=workflow_id,
+            workflow_type=WorkflowType.SQL_REVIEW,
+        )
+        audit_id = audit_detail.audit_id
+        last_operation_info = Audit.logs(audit_id=audit_id).latest("id").operation_info
+    except Exception as e:
+        logger.debug(f"无审核日志记录，错误信息{e}")
+        last_operation_info = ""
+
     # 自动审批不通过的不需要获取下列信息
     if workflow_detail.status != "workflow_autoreviewwrong":
         # 是否可审核
@@ -249,27 +261,12 @@ def detail(request, workflow_id):
         is_can_cancel = can_cancel(request.user, workflow_id)
         # 是否可查看回滚信息
         is_can_rollback = can_rollback(request.user, workflow_id)
-
-        # 获取审核日志
-        try:
-            audit_detail = Audit.detail_by_workflow_id(
-                workflow_id=workflow_id,
-                workflow_type=WorkflowType.SQL_REVIEW,
-            )
-            audit_id = audit_detail.audit_id
-            last_operation_info = (
-                Audit.logs(audit_id=audit_id).latest("id").operation_info
-            )
-        except Exception as e:
-            logger.debug(f"无审核日志记录，错误信息{e}")
-            last_operation_info = ""
     else:
         is_can_review = False
         is_can_execute = False
         is_can_timingtask = False
         is_can_cancel = False
         is_can_rollback = False
-        last_operation_info = None
 
     # 获取定时执行任务信息
     if workflow_detail.status == "workflow_timingtask":
@@ -298,6 +295,7 @@ def detail(request, workflow_id):
 
     context = {
         "workflow_detail": workflow_detail,
+        "audit_id": audit_id,
         "current_reviewers": current_reviewers,
         "last_operation_info": last_operation_info,
         "is_can_review": is_can_review,
@@ -309,6 +307,12 @@ def detail(request, workflow_id):
         "manual": manual,
         "run_date": run_date,
     }
+    return context
+
+
+def detail(request, workflow_id):
+    """展示SQL工单详细页面"""
+    context = _sqlworkflow_detail_context(request, workflow_id)
     return render(request, "detail.html", context)
 
 
@@ -349,11 +353,13 @@ def rollback(request):
         return response
     # 异步获取，并在页面展示，如果数据量大加载会缓慢
     else:
+        workflow_audit = workflow.get_audit()
         rollback_workflow_name = (
             f"【回滚工单】原工单Id:{workflow_id} ,{workflow.workflow_name}"
         )
         context = {
             "workflow_detail": workflow,
+            "audit_id": workflow_audit.audit_id if workflow_audit else None,
             "rollback_workflow_name": rollback_workflow_name,
         }
         return render(request, "rollback.html", context)
@@ -404,8 +410,7 @@ def queryapplylist(request):
     return render(request, "queryapplylist.html", context)
 
 
-def queryapplydetail(request, apply_id):
-    """查询权限申请详情页面"""
+def _queryapplydetail_context(request, apply_id):
     workflow_detail = QueryPrivilegesApply.objects.get(apply_id=apply_id)
     # 获取当前审批和审批流程
     audit_handler = AuditV2(workflow=workflow_detail)
@@ -446,6 +451,12 @@ def queryapplydetail(request, apply_id):
         "last_operation_info": last_operation_info,
         "is_can_review": is_can_review,
     }
+    return context
+
+
+def queryapplydetail(request, apply_id):
+    """查询权限申请详情页面"""
+    context = _queryapplydetail_context(request, apply_id)
     return render(request, "queryapplydetail.html", context)
 
 
@@ -543,8 +554,7 @@ def archive(request):
     )
 
 
-def archive_detail(request, id):
-    """归档详情页面"""
+def _archive_detail_context(request, id):
     archive_config = ArchiveConfig.objects.get(pk=id)
     # 获取当前审批和审批流程、是否可审核
     audit_handler = AuditV2(
@@ -589,6 +599,12 @@ def archive_detail(request, id):
         "last_operation_info": last_operation_info,
         "can_review": can_review,
     }
+    return context
+
+
+def archive_detail(request, id):
+    """归档详情页面"""
+    context = _archive_detail_context(request, id)
     return render(request, "archivedetail.html", context)
 
 
@@ -602,7 +618,15 @@ def config(request):
     # 获取所有实例标签
     instance_tags = InstanceTag.objects.all()
     # 支持自动审核的数据库类型
-    db_type = ["mysql", "oracle", "mongo", "clickhouse", "redis", "doris", "tdengine"]
+    db_type = [
+        "mysql",
+        "oracle",
+        "mongo",
+        "clickhouse",
+        "redis",
+        "doris",
+        "tdengine",
+    ]
     # 获取所有配置项
     all_config = Config.objects.all().values("item", "value")
     sys_config = {}
@@ -653,17 +677,15 @@ def workflowsdetail(request, audit_id):
     if not audit_detail:
         raise Http404("不存在对应的工单记录")
     if audit_detail.workflow_type == WorkflowType.QUERY:
-        return HttpResponseRedirect(
-            reverse("sql:queryapplydetail", args=(audit_detail.workflow_id,))
-        )
+        context = _queryapplydetail_context(request, audit_detail.workflow_id)
+        return render(request, "queryapplydetail.html", context)
     elif audit_detail.workflow_type == WorkflowType.SQL_REVIEW:
-        return HttpResponseRedirect(
-            reverse("sql:detail", args=(audit_detail.workflow_id,))
-        )
+        context = _sqlworkflow_detail_context(request, audit_detail.workflow_id)
+        return render(request, "detail.html", context)
     elif audit_detail.workflow_type == WorkflowType.ARCHIVE:
-        return HttpResponseRedirect(
-            reverse("sql:archive_detail", args=(audit_detail.workflow_id,))
-        )
+        context = _archive_detail_context(request, audit_detail.workflow_id)
+        return render(request, "archivedetail.html", context)
+    raise Http404("不支持的工单类型")
 
 
 @permission_required("sql.menu_document", raise_exception=True)

@@ -10,7 +10,13 @@ from pytest_django.asserts import assertRedirects
 import sql.query_privileges
 from common.config import SysConfig
 from common.utils.const import WorkflowAction, WorkflowStatus
-from sql.models import Instance, ResourceGroup, QueryPrivilegesApply, QueryPrivileges
+from sql.models import (
+    Instance,
+    InstanceTag,
+    ResourceGroup,
+    QueryPrivilegesApply,
+    QueryPrivileges,
+)
 from sql.tests import User
 from sql.utils.workflow_audit import AuditV2
 
@@ -27,7 +33,7 @@ class TestQueryPrivilegesApply(TestCase):
             type="slave",
             db_type="mysql",
             host=settings.DATABASES["default"]["HOST"],
-            port=settings.DATABASES["default"]["PORT"],
+            port=settings.DATABASES["default"]["PORT"] or 0,
             user=settings.DATABASES["default"]["USER"],
             password=settings.DATABASES["default"]["PASSWORD"],
         )
@@ -136,7 +142,8 @@ class TestQueryPrivilegesApply(TestCase):
         self.client.force_login(self.superuser)
         r = self.client.post(path="/query/applylist/", data=data)
         self.assertEqual(json.loads(r.content)["total"], 1)
-        keys = list(json.loads(r.content)["rows"][0].keys())
+        row = json.loads(r.content)["rows"][0]
+        keys = list(row.keys())
         self.assertListEqual(
             keys,
             [
@@ -152,7 +159,45 @@ class TestQueryPrivilegesApply(TestCase):
                 "status",
                 "create_time",
                 "group_name",
+                "audit_id",
             ],
+        )
+        self.assertIsNone(row["audit_id"])
+
+    def test_query_priv_apply_rejects_table_priv_for_gaussdb(self):
+        """测试 GaussDB 实例不允许绕过页面直接申请表级权限"""
+        tag = InstanceTag.objects.create(tag_code="can_read", tag_name="可读")
+        self.slave.db_type = "gaussdb"
+        self.slave.save(update_fields=["db_type"])
+        self.slave.resource_group.add(self.group)
+        self.slave.instance_tag.add(tag)
+        self.user.resource_group.add(self.group)
+        self.user.user_permissions.add(
+            Permission.objects.get(codename="query_applypriv")
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.post(
+            path="/query/applyforprivileges/",
+            data={
+                "title": "gaussdb table privilege",
+                "group_name": self.group.group_name,
+                "instance_name": self.slave.instance_name,
+                "priv_type": "2",
+                "db_name": self.db_name,
+                "table_list[]": ["sql_users"],
+                "valid_date": date.today() + timedelta(days=1),
+                "limit_num": "10",
+            },
+        )
+        data = json.loads(response.content.decode())
+
+        self.assertEqual(data["status"], 1)
+        self.assertEqual(data["msg"], "仅 MySQL 支持表级查询权限申请")
+        self.assertFalse(
+            QueryPrivilegesApply.objects.filter(
+                title="gaussdb table privilege"
+            ).exists()
         )
 
     def test_query_priv_apply_list_with_query_review_perm(self):
@@ -169,7 +214,8 @@ class TestQueryPrivilegesApply(TestCase):
         self.client.force_login(self.user)
         r = self.client.post(path="/query/applylist/", data=data)
         self.assertEqual(json.loads(r.content)["total"], 1)
-        keys = list(json.loads(r.content)["rows"][0].keys())
+        row = json.loads(r.content)["rows"][0]
+        keys = list(row.keys())
         self.assertListEqual(
             keys,
             [
@@ -185,8 +231,10 @@ class TestQueryPrivilegesApply(TestCase):
                 "status",
                 "create_time",
                 "group_name",
+                "audit_id",
             ],
         )
+        self.assertIsNone(row["audit_id"])
 
     def test_query_priv_apply_list_no_query_review_perm(self):
         """
@@ -310,7 +358,7 @@ class TestQueryPrivilegesCheck(TestCase):
             type="slave",
             db_type="mysql",
             host=settings.DATABASES["default"]["HOST"],
-            port=settings.DATABASES["default"]["PORT"],
+            port=settings.DATABASES["default"]["PORT"] or 0,
             user=settings.DATABASES["default"]["USER"],
             password=settings.DATABASES["default"]["PASSWORD"],
         )
@@ -692,6 +740,186 @@ class TestQueryPrivilegesCheck(TestCase):
         )
 
 
+class TestQueryPrivModify(TestCase):
+    """测试 query_priv_modify 接口"""
+
+    def setUp(self):
+        self.superuser = User.objects.create(username="super", is_superuser=True)
+        self.user = User.objects.create(username="user")
+        self.no_perm_user = User.objects.create(username="noperm")
+        query_mgtpriv = Permission.objects.get(codename="query_mgtpriv")
+        self.user.user_permissions.add(query_mgtpriv)
+        self.slave = Instance.objects.create(
+            instance_name="test_instance",
+            type="slave",
+            db_type="mysql",
+            host=settings.DATABASES["default"]["HOST"],
+            port=settings.DATABASES["default"]["PORT"] or 0,
+            user=settings.DATABASES["default"]["USER"],
+            password=settings.DATABASES["default"]["PASSWORD"],
+        )
+        self.db_name = settings.DATABASES["default"]["TEST"]["NAME"]
+        tomorrow = datetime.today() + timedelta(days=1)
+        self.priv = QueryPrivileges.objects.create(
+            user_name=self.user.username,
+            user_display="user",
+            instance=self.slave,
+            db_name=self.db_name,
+            table_name="test_table",
+            valid_date=tomorrow,
+            limit_num=100,
+            priv_type=2,
+        )
+        self.client = Client()
+
+    def tearDown(self):
+        self.superuser.delete()
+        self.user.delete()
+        self.no_perm_user.delete()
+        Instance.objects.all().delete()
+        QueryPrivileges.objects.all().delete()
+
+    def test_modify_no_privilege_id(self):
+        """未传 privilege_id 或 privilege_ids，返回错误"""
+        self.client.force_login(self.user)
+        r = self.client.post("/query/modifyprivileges/", data={"type": "1"})
+        result = json.loads(r.content)
+        self.assertEqual(result["status"], 1)
+        self.assertIn("privilege_id", result["msg"])
+
+    def test_modify_invalid_privilege_id(self):
+        """传入非法 privilege_id，返回格式错误"""
+        self.client.force_login(self.user)
+        r = self.client.post(
+            "/query/modifyprivileges/", data={"type": "1", "privilege_id": "abc"}
+        )
+        result = json.loads(r.content)
+        self.assertEqual(result["status"], 1)
+        self.assertIn("格式错误", result["msg"])
+
+    def test_modify_invalid_privilege_ids(self):
+        """传入非法 privilege_ids，返回格式错误"""
+        self.client.force_login(self.user)
+        r = self.client.post(
+            "/query/modifyprivileges/", data={"type": "1", "privilege_ids": "1,abc,3"}
+        )
+        result = json.loads(r.content)
+        self.assertEqual(result["status"], 1)
+        self.assertIn("格式错误", result["msg"])
+
+    def test_modify_privilege_not_exist(self):
+        """传入不存在的 privilege_id，返回权限不存在"""
+        self.client.force_login(self.user)
+        r = self.client.post(
+            "/query/modifyprivileges/", data={"type": "1", "privilege_id": "999999"}
+        )
+        result = json.loads(r.content)
+        self.assertEqual(result["status"], 1)
+        self.assertIn("不存在", result["msg"])
+
+    def test_modify_delete_single(self):
+        """type=1，单条删除权限（is_deleted=1）"""
+        self.client.force_login(self.user)
+        r = self.client.post(
+            "/query/modifyprivileges/",
+            data={"type": "1", "privilege_id": str(self.priv.privilege_id)},
+        )
+        result = json.loads(r.content)
+        self.assertEqual(result["status"], 0)
+        self.priv.refresh_from_db()
+        self.assertEqual(self.priv.is_deleted, 1)
+
+    def test_modify_delete_batch(self):
+        """type=1，批量删除权限"""
+        tomorrow = datetime.today() + timedelta(days=1)
+        priv2 = QueryPrivileges.objects.create(
+            user_name=self.user.username,
+            user_display="user",
+            instance=self.slave,
+            db_name=self.db_name,
+            table_name="test_table2",
+            valid_date=tomorrow,
+            limit_num=50,
+            priv_type=2,
+        )
+        self.client.force_login(self.user)
+        ids = f"{self.priv.privilege_id},{priv2.privilege_id}"
+        r = self.client.post(
+            "/query/modifyprivileges/", data={"type": "1", "privilege_ids": ids}
+        )
+        result = json.loads(r.content)
+        self.assertEqual(result["status"], 0)
+        self.priv.refresh_from_db()
+        priv2.refresh_from_db()
+        self.assertEqual(self.priv.is_deleted, 1)
+        self.assertEqual(priv2.is_deleted, 1)
+
+    def test_modify_update_single(self):
+        """type=2，单条变更权限的 valid_date 和 limit_num"""
+        self.client.force_login(self.user)
+        new_date = (datetime.today() + timedelta(days=10)).strftime("%Y-%m-%d")
+        r = self.client.post(
+            "/query/modifyprivileges/",
+            data={
+                "type": "2",
+                "privilege_id": str(self.priv.privilege_id),
+                "valid_date": new_date,
+                "limit_num": "200",
+            },
+        )
+        result = json.loads(r.content)
+        self.assertEqual(result["status"], 0)
+        self.priv.refresh_from_db()
+        self.assertEqual(self.priv.limit_num, 200)
+
+    def test_modify_update_batch(self):
+        """type=2，批量变更权限的 valid_date 和 limit_num"""
+        tomorrow = datetime.today() + timedelta(days=1)
+        priv2 = QueryPrivileges.objects.create(
+            user_name=self.user.username,
+            user_display="user",
+            instance=self.slave,
+            db_name=self.db_name,
+            table_name="test_table2",
+            valid_date=tomorrow,
+            limit_num=50,
+            priv_type=2,
+        )
+        self.client.force_login(self.user)
+        ids = f"{self.priv.privilege_id},{priv2.privilege_id}"
+        new_date = (datetime.today() + timedelta(days=10)).strftime("%Y-%m-%d")
+        r = self.client.post(
+            "/query/modifyprivileges/",
+            data={
+                "type": "2",
+                "privilege_ids": ids,
+                "valid_date": new_date,
+                "limit_num": "300",
+            },
+        )
+        result = json.loads(r.content)
+        self.assertEqual(result["status"], 0)
+        self.priv.refresh_from_db()
+        priv2.refresh_from_db()
+        self.assertEqual(self.priv.limit_num, 300)
+        self.assertEqual(priv2.limit_num, 300)
+
+    def test_modify_no_permission(self):
+        """无 query_mgtpriv 权限的用户访问，返回 403"""
+        from django.core.exceptions import PermissionDenied
+        from sql.query_privileges import query_priv_modify
+        from django.test import RequestFactory
+
+        factory = RequestFactory()
+        request = factory.post(
+            "/query/modifyprivileges/",
+            data={"type": "1", "privilege_id": str(self.priv.privilege_id)},
+        )
+        request.user = self.no_perm_user
+        with self.assertRaises(PermissionDenied):
+            query_priv_modify(request)
+
+
 def test_query_privilege_audit(
     sql_query_apply, resource_group, super_user, client, fake_generate_audit_setting
 ):
@@ -709,7 +937,7 @@ def test_query_privilege_audit(
     assertRedirects(
         response,
         fetch_redirect_response=False,
-        expected_url=f"/queryapplydetail/{sql_query_apply.apply_id}/",
+        expected_url=f"/workflow/{auditor.audit.audit_id}/",
     )
     sql_query_apply.refresh_from_db()
     assert sql_query_apply.status == WorkflowStatus.PASSED

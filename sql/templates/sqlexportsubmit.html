@@ -279,7 +279,7 @@
             //将数据通过ajax提交给获取db_name
             $.ajax({
                 type: "get",
-                url: "/instance/instance_resource/",
+                url: "/api/v1/sqlquery/resources/",
                 dataType: "json",
                 data: {
                     instance_name: $("#instance_name").val(),
@@ -330,7 +330,7 @@
             //将数据通过ajax提交给获取db_name
             $.ajax({
                 type: "get",
-                url: "/instance/instance_resource/",
+                url: "/api/v1/sqlquery/resources/",
                 dataType: "json",
                 data: {
                     instance_name: $("#instance_name").val(),
@@ -527,7 +527,7 @@
             if (data.status === 0) {
                 var ActualRows = 0;
                 var maxExportRows = "{{ max_export_rows }}";
-                ActualRows = parseFloat(result['rows'][0]['affected_rows']);
+                ActualRows = parseFloat(result['affected_rows']);
                 if (ActualRows > maxExportRows) {
                     $("#btn-submitsql").prop("disabled", true);
                     showStatusNotice({
@@ -553,8 +553,8 @@
                 }
             } else {
                 var msg = data.msg;
-                if (result && result['rows'] && result['rows'].length > 0) {
-                    msg = result['rows'][0]['errormessage'];
+                if (result && result['error']) {
+                    msg = result['error'];
                 }
                 showStatusNotice({
                     noticeIconClass: 'icon-error',
@@ -580,7 +580,7 @@
             }
             $.ajax({
                 type: "post",
-                url: "/api/v1/workflow/",
+                url: "/api/v1/sql-workflows/",
                 dataType: "json",
                 contentType: 'application/json;',
                 data: JSON.stringify({
@@ -607,7 +607,11 @@
                     editor.container.style.opacity = 1;
                 },
                 success: function (data) {
-                    window.location.href = "/detail/"+ data.workflow_id
+                    if (data.data && data.data.audit_id) {
+                        window.location.href = "/workflow/" + data.data.audit_id + "/";
+                    } else {
+                        window.location.href = data.data && data.data.redirect_url ? data.data.redirect_url : "/detail/" + data.workflow_id
+                    }
                 },
                 error: function (XMLHttpRequest, textStatus, errorThrown) {
                     if (XMLHttpRequest.responseJSON) {
